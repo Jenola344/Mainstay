@@ -435,8 +435,6 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .extend_ttl(&PAUSED_KEY, 518400, 518400);
-        env.storage().instance().set(&PAUSED_KEY, &true);
-        env.storage().instance().extend_ttl(518400, 518400);
         env.events().publish((symbol_short!("PAUSED"),), (admin,));
     }
 
@@ -462,8 +460,6 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .extend_ttl(&PAUSED_KEY, 518400, 518400);
-        env.storage().instance().set(&PAUSED_KEY, &false);
-        env.storage().instance().extend_ttl(518400, 518400);
         env.events().publish((symbol_short!("UNPAUSED"),), (admin,));
     }
 
@@ -1057,13 +1053,6 @@ impl Lifecycle {
     ///
     /// # Returns
     /// Vec containing all maintenance records in chronological order
-    /// Get the complete maintenance history for an asset.
-    ///
-    /// # Arguments
-    /// * `asset_id` - The unique identifier of the asset
-    ///
-    /// # Returns
-    /// Vec containing all maintenance records in chronological order
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
@@ -1111,9 +1100,6 @@ impl Lifecycle {
         }
         if offset >= len {
             return Vec::new(&env);
-        }
-        if offset >= len {
-            panic_with_error!(&env, ContractError::IndexOutOfBounds);
         }
 
         let end = (offset + limit).min(len);
@@ -1341,9 +1327,6 @@ impl Lifecycle {
         }
         if offset >= len {
             return Vec::new(&env);
-        }
-        if offset >= len {
-            panic_with_error!(&env, ContractError::IndexOutOfBounds);
         }
 
         let end = (offset + limit).min(len);

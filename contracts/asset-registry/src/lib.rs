@@ -51,13 +51,6 @@ pub const DEREG_TOPIC: Symbol = symbol_short!("DEREG");
 pub const ADD_TYPE_TOPIC: Symbol = symbol_short!("ADD_TYPE");
 pub const RM_TYPE_TOPIC: Symbol = symbol_short!("RM_TYPE");
 
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum Error {
-    MetadataTooLong = 1,
-}
-
 fn asset_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("ASSET"), id)
 }
