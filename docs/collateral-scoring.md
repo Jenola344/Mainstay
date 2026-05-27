@@ -6,10 +6,30 @@ This document describes the collateral scoring model used in the Mainstay lifecy
 
 The collateral scoring system is designed to provide a quantitative measure of an asset's maintenance quality and recency. Higher scores indicate well-maintained assets that are more suitable for use as collateral in financial transactions.
 
+## Score Floor
+
+Assets with at least one verified maintenance record are guaranteed a minimum score of **1** (`MIN_SCORE_WITH_HISTORY`), even if time-based decay would otherwise reduce the raw score to 0.
+
+This prevents a legitimately-maintained asset from becoming indistinguishable from one with no history at all.
+
+| Maintenance records | Minimum score returned |
+|---------------------|------------------------|
+| 0                   | 0                      |
+| ≥ 1                 | 1 (floor)              |
+
+### Minimum records for non-zero score
+
+With default configuration (`score_increment = 5`):
+
+- **1 record** → raw score = 5 (non-zero immediately after submission)
+- After sufficient decay the raw score reaches 0, but the floor ensures `get_collateral_score` returns **1**
+
+To reach the default **eligibility threshold of 50**, an asset needs at least **10 records** at the default increment of 5 points each (or fewer records using higher-weight task types such as `ENGINE` / `OVERHAUL` at 10 points each).
+
 ## Score Mechanics
 
 ### Score Range
-- **Minimum Score**: 0 points
+- **Minimum Score**: 0 points (no maintenance history), or **1 point** (at least one record — see [Score Floor](#score-floor))
 - **Maximum Score**: 100 points
 - **Eligibility Threshold**: 50 points (default, configurable)
 

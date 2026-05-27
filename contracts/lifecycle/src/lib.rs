@@ -72,6 +72,10 @@ const DEFAULT_DECAY_RATE: u32 = 5;
 const DEFAULT_DECAY_INTERVAL: u64 = 2592000; // 30 days in seconds
 const DEFAULT_ELIGIBILITY_THRESHOLD: u32 = 50;
 const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
+/// Minimum score returned for an asset that has at least one maintenance record.
+/// Prevents decay from making a legitimately-maintained asset indistinguishable
+/// from one with no history at all.
+const MIN_SCORE_WITH_HISTORY: u32 = 1;
 
 const EVENT_INIT: Symbol = symbol_short!("INIT");
 const EVENT_MAINT: Symbol = symbol_short!("MAINT");
@@ -1179,7 +1183,20 @@ impl Lifecycle {
             .persistent()
             .get::<_, Config>(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        compute_decay(&env, asset_id)
+        let score = compute_decay(&env, asset_id);
+        // Apply floor: an asset with at least one maintenance record always scores >= 1
+        // so it is never indistinguishable from an asset with no history.
+        let has_history = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<MaintenanceRecord>>(&history_key(asset_id))
+            .map(|h| !h.is_empty())
+            .unwrap_or(false);
+        if has_history && score < MIN_SCORE_WITH_HISTORY {
+            MIN_SCORE_WITH_HISTORY
+        } else {
+            score
+        }
     }
 
     /// Returns the full score trend: one (timestamp, score) entry per maintenance event.
@@ -1265,7 +1282,19 @@ impl Lifecycle {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
 
         // Use read-only decay computation since we already verified asset exists
-        compute_decay(&env, asset_id) >= config.eligibility_threshold
+        let score = compute_decay(&env, asset_id);
+        let has_history = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<MaintenanceRecord>>(&history_key(asset_id))
+            .map(|h| !h.is_empty())
+            .unwrap_or(false);
+        let effective_score = if has_history && score < MIN_SCORE_WITH_HISTORY {
+            MIN_SCORE_WITH_HISTORY
+        } else {
+            score
+        };
+        effective_score >= config.eligibility_threshold
     }
 
     /// Returns the timestamp of the most recent maintenance event, or None if no maintenance has been submitted.
@@ -5849,5 +5878,39 @@ mod tests {
         // BUG: Currently, asset_id is STILL in engineer's history
         let history_after = lifecycle.get_eng_history_page(&engineer, &0, &10);
         assert!(!history_after.contains(asset_id), "Asset ID should be removed from engineer history after purge");
+    }
+
+    /// An asset with a single maintenance record must never score 0, even after enough
+    /// time has elapsed for decay to fully consume the raw score.
+    #[test]
+    fn test_score_floor_with_sparse_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // One record → raw score = DEFAULT_SCORE_INCREMENT (5)
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "single record"),
+            &engineer,
+        );
+        assert_eq!(client.get_collateral_score(&asset_id), 5);
+
+        // Advance time by 2 full decay intervals (2 × 30 days).
+        // Decay = 2 × DEFAULT_DECAY_RATE (5) = 10 > raw score (5), so raw result = 0.
+        env.ledger().with_mut(|li| {
+            li.timestamp += 2 * 2_592_000; // 60 days
+        });
+
+        // Floor must kick in: score is 1, not 0.
+        assert_eq!(
+            client.get_collateral_score(&asset_id),
+            1,
+            "asset with maintenance history must not score 0 after decay"
+        );
     }
 }
