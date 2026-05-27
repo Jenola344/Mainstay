@@ -89,6 +89,40 @@ fn type_count_dec(env: &Env, asset_type: &Symbol) {
     }
 }
 
+/// Type-to-assets index key: asset_type → Vec<u64> of asset IDs.
+fn type_assets_key(asset_type: &Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("TYP_IDX"), asset_type.clone())
+}
+
+fn type_assets_add(env: &Env, asset_type: &Symbol, asset_id: u64) {
+    let key = type_assets_key(asset_type);
+    let mut ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    ids.push_back(asset_id);
+    env.storage().persistent().set(&key, &ids);
+    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+}
+
+fn type_assets_remove(env: &Env, asset_type: &Symbol, asset_id: u64) {
+    let key = type_assets_key(asset_type);
+    let ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    let mut updated: Vec<u64> = Vec::new(env);
+    for id in ids.iter() {
+        if id != asset_id {
+            updated.push_back(id);
+        }
+    }
+    env.storage().persistent().set(&key, &updated);
+    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+}
+
 /// Append an asset ID to the owner's index.
 fn owner_index_add(env: &Env, owner: &Address, asset_id: u64) {
     let key = owner_index_key(owner);
@@ -205,6 +239,9 @@ impl AssetRegistry {
         // Increment type count
         type_count_inc(&env, &asset_type);
 
+        // Update type-to-assets index
+        type_assets_add(&env, &asset_type, id);
+
         // Emit asset registration event
         env.events().publish(
             (symbol_short!("REG_AST"), id),
@@ -279,6 +316,9 @@ impl AssetRegistry {
 
             // Increment type count
             type_count_inc(&env, &asset_in.asset_type);
+
+            // Update type-to-assets index
+            type_assets_add(&env, &asset_in.asset_type, id);
 
             env.events().publish(
                 (symbol_short!("REG_AST"), id),
@@ -388,6 +428,49 @@ impl AssetRegistry {
     /// The total number of assets that have been registered
     pub fn asset_count(env: Env) -> u64 {
         env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0)
+    }
+
+    /// Returns all asset IDs of the given type.
+    pub fn get_assets_by_type(env: Env, asset_type: Symbol) -> Vec<u64> {
+        let key = type_assets_key(&asset_type);
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, 518400, 518400);
+        }
+        ids
+    }
+
+    /// Returns a paginated list of asset IDs of the given type.
+    ///
+    /// # Arguments
+    /// * `asset_type` - The asset type symbol to query
+    /// * `offset` - Starting index for pagination
+    /// * `limit` - Maximum number of asset IDs to return
+    pub fn get_assets_by_type_page(
+        env: Env,
+        asset_type: Symbol,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<u64> {
+        let all: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&type_assets_key(&asset_type))
+            .unwrap_or_else(|| Vec::new(&env));
+        let len = all.len();
+        if offset >= len || limit == 0 {
+            return Vec::new(&env);
+        }
+        let end = (offset + limit).min(len);
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(all.get(i).unwrap());
+        }
+        page
     }
 
     /// Initialize the admin address for the contract.
@@ -566,6 +649,9 @@ impl AssetRegistry {
 
         // Decrement type count
         type_count_dec(&env, &asset.asset_type);
+
+        // Remove from type-to-assets index
+        type_assets_remove(&env, &asset.asset_type, asset_id);
 
         // Emit deregistration event
         env.events().publish(
@@ -2840,5 +2926,143 @@ mod tests {
 
         // get_admin must still resolve correctly (TTL was extended at init time)
         assert_eq!(client.get_admin(), admin);
+    }
+
+    fn setup_with_types(env: &Env) -> (AssetRegistryClient, Address, Address) {
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.initialize_admin(&admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+        (client, admin, Address::generate(env))
+    }
+
+    #[test]
+    fn test_get_assets_by_type_registration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, owner) = setup_with_types(&env);
+
+        let id1 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator A"),
+            &owner,
+        );
+        let id2 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator B"),
+            &owner,
+        );
+        client.register_asset(
+            &symbol_short!("TURBINE"),
+            &String::from_str(&env, "Turbine X"),
+            &owner,
+        );
+
+        let gensets = client.get_assets_by_type(&symbol_short!("GENSET"));
+        assert_eq!(gensets.len(), 2);
+        assert_eq!(gensets.get(0).unwrap(), id1);
+        assert_eq!(gensets.get(1).unwrap(), id2);
+
+        let turbines = client.get_assets_by_type(&symbol_short!("TURBINE"));
+        assert_eq!(turbines.len(), 1);
+    }
+
+    #[test]
+    fn test_get_assets_by_type_after_deregister() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, owner) = setup_with_types(&env);
+
+        let id1 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator A"),
+            &owner,
+        );
+        let id2 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator B"),
+            &owner,
+        );
+
+        client.deregister_asset(&admin, &id1);
+
+        let gensets = client.get_assets_by_type(&symbol_short!("GENSET"));
+        assert_eq!(gensets.len(), 1);
+        assert_eq!(gensets.get(0).unwrap(), id2);
+    }
+
+    #[test]
+    fn test_get_assets_by_type_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, owner) = setup_with_types(&env);
+
+        let metas = [
+            "Generator 0",
+            "Generator 1",
+            "Generator 2",
+            "Generator 3",
+            "Generator 4",
+        ];
+        let mut ids: Vec<u64> = Vec::new(&env);
+        for meta in metas.iter() {
+            ids.push_back(client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, meta),
+                &owner,
+            ));
+        }
+
+        // Page 0: first 2
+        let page0 = client.get_assets_by_type_page(&symbol_short!("GENSET"), &0, &2);
+        assert_eq!(page0.len(), 2);
+        assert_eq!(page0.get(0).unwrap(), ids.get(0).unwrap());
+        assert_eq!(page0.get(1).unwrap(), ids.get(1).unwrap());
+
+        // Page 1: next 2
+        let page1 = client.get_assets_by_type_page(&symbol_short!("GENSET"), &2, &2);
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1.get(0).unwrap(), ids.get(2).unwrap());
+
+        // Last page: 1 item
+        let page2 = client.get_assets_by_type_page(&symbol_short!("GENSET"), &4, &2);
+        assert_eq!(page2.len(), 1);
+
+        // Out-of-bounds offset returns empty
+        let empty = client.get_assets_by_type_page(&symbol_short!("GENSET"), &10, &2);
+        assert_eq!(empty.len(), 0);
+    }
+
+    #[test]
+    fn test_get_assets_by_type_batch_register() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, owner) = setup_with_types(&env);
+
+        let assets = soroban_sdk::vec![
+            &env,
+            AssetInput {
+                asset_type: symbol_short!("GENSET"),
+                metadata: String::from_str(&env, "Generator Batch 1"),
+            },
+            AssetInput {
+                asset_type: symbol_short!("GENSET"),
+                metadata: String::from_str(&env, "Generator Batch 2"),
+            },
+            AssetInput {
+                asset_type: symbol_short!("TURBINE"),
+                metadata: String::from_str(&env, "Turbine Batch 1"),
+            },
+        ];
+
+        client.batch_register_assets(&owner, &assets);
+
+        let gensets = client.get_assets_by_type(&symbol_short!("GENSET"));
+        assert_eq!(gensets.len(), 2);
+
+        let turbines = client.get_assets_by_type(&symbol_short!("TURBINE"));
+        assert_eq!(turbines.len(), 1);
     }
 }
