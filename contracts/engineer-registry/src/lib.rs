@@ -178,8 +178,13 @@ impl EngineerRegistry {
 
         // Emit engineer registration event
         env.events().publish(
-            (REG_ENG_TOPIC, engineer.clone()),
-            (issuer, credential_hash.clone(), now, now + validity_period),
+            (symbol_short!("reg_eng"),),
+            (
+                engineer.clone(),
+                credential_hash.clone(),
+                issuer.clone(),
+                now,
+            ),
         );
     }
 
@@ -730,26 +735,25 @@ mod tests {
         let issued_at = env.ledger().timestamp();
         client.register_engineer(&engineer, &hash, &issuer, &validity_period);
 
-        // ISS_ADD event fires first, REG_ENG is the second event
+        // ISS_ADD event fires first, reg_eng is the second event
         let events = env.events().all();
         let (_, topics, data) = events.last().unwrap();
 
         use soroban_sdk::TryIntoVal;
+        let reg_topic = symbol_short!("reg_eng");
         let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-        let t1: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(t0, REG_ENG_TOPIC);
-        assert_eq!(t1, engineer);
+        assert_eq!(t0, reg_topic);
 
-        let (emitted_issuer, emitted_hash, emitted_issued_at, emitted_expires_at): (
-            Address,
-            BytesN<32>,
-            u64,
-            u64,
-        ) = data.try_into_val(&env).unwrap();
-        assert_eq!(emitted_issuer, issuer);
+        let (
+            emitted_engineer,
+            emitted_hash,
+            emitted_issuer,
+            emitted_timestamp,
+        ): (Address, BytesN<32>, Address, u64) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_engineer, engineer);
         assert_eq!(emitted_hash, hash);
-        assert_eq!(emitted_issued_at, issued_at);
-        assert_eq!(emitted_expires_at, issued_at + validity_period);
+        assert_eq!(emitted_issuer, issuer);
+        assert_eq!(emitted_timestamp, issued_at);
     }
 
     #[test]
@@ -816,7 +820,7 @@ mod tests {
         client.initialize_admin(&admin, &admin);
 
         // Second call should fail with structured error
-        let result = client.try_initialize_admin(&admin);
+        let result = client.try_initialize_admin(&admin, &admin);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -2405,6 +2409,8 @@ mod tests {
 
         let result = client.try_initialize_admin(&deployer, &attacker);
         assert!(result.is_err(), "non-deployer must not be able to initialize");
+    }
+
     fn setup_engineer(
         env: &Env,
         client: &EngineerRegistryClient,
@@ -2429,7 +2435,7 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let issuer = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_trusted_issuer(&admin, &issuer);
 
         let e1 = setup_engineer(&env, &client, &issuer, 1);
@@ -2451,7 +2457,7 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let issuer = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_trusted_issuer(&admin, &issuer);
 
         let active = setup_engineer(&env, &client, &issuer, 10);
@@ -2476,7 +2482,7 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let issuer = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_trusted_issuer(&admin, &issuer);
 
         let e1 = setup_engineer(&env, &client, &issuer, 20);
