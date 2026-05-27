@@ -104,7 +104,7 @@ impl EngineerRegistry {
     ///
     /// # Arguments
     /// * `engineer` - The address of the engineer being registered
-    /// * `credential_hash` - Hash of the engineer's credentials/certifications
+    /// * `credential_hash` - SHA-256 hash of the engineer's credentials (32 bytes; as hex string: 64 characters)
     /// * `issuer` - The trusted issuer address registering the engineer
     /// * `validity_period` - Duration in seconds for which the credentials are valid
     ///
@@ -2110,6 +2110,27 @@ mod tests {
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::EngineerAlreadyRegistered as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_register_engineer_rejects_invalid_credential_hash() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let invalid_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let result = client.try_register_engineer(&engineer, &invalid_hash, &issuer, &31_536_000);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidCredentialHash as u32,
             ))),
         );
     }
