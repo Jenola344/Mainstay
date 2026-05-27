@@ -1,4 +1,5 @@
 #![no_std]
+use shared::validation::{require_non_empty_vec, require_string_length};
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, panic_with_error, symbol_short,
@@ -140,7 +141,9 @@ fn owner_index_add(env: &Env, owner: &Address, asset_id: u64) {
         .unwrap_or_else(|| Vec::new(env));
     ids.push_back(asset_id);
     env.storage().persistent().set(&key, &ids);
-    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 /// Remove an asset ID from the owner's index.
@@ -175,7 +178,9 @@ fn owner_index_remove(env: &Env, owner: &Address, asset_id: u64) {
         env.storage().persistent().extend_ttl(&key, 518400, 518400);
     }
     env.storage().persistent().set(&key, &updated);
-    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn is_paused(env: &Env) -> bool {
@@ -210,9 +215,7 @@ impl AssetRegistry {
         ensure_not_paused(&env);
         owner.require_auth();
 
-        if metadata.is_empty() {
-            panic_with_error!(&env, ContractError::EmptyMetadata);
-        }
+        require_string_length(&metadata, "metadata", 256);
 
         // Validate asset type against allowlist
         if !Self::is_valid_asset_type(env.clone(), asset_type.clone()) {
@@ -276,6 +279,7 @@ impl AssetRegistry {
     pub fn batch_register_assets(env: Env, owner: Address, assets: Vec<AssetInput>) -> Vec<u64> {
         ensure_not_paused(&env);
         owner.require_auth();
+        require_non_empty_vec(&assets, "assets");
 
         let mut ids: Vec<u64> = Vec::new(&env);
         let mut batch_hashes: Vec<BytesN<32>> = Vec::new(&env);
@@ -283,6 +287,7 @@ impl AssetRegistry {
         let mut next_id: u64 = env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0);
 
         for asset_in in assets.iter() {
+            require_string_length(&asset_in.metadata, "metadata", 256);
             if !Self::is_valid_asset_type(env.clone(), asset_in.asset_type.clone()) {
                 panic_with_error!(&env, ContractError::InvalidAssetType);
             }
@@ -322,9 +327,11 @@ impl AssetRegistry {
             env.storage()
                 .persistent()
                 .set(&dedup_key(&owner, &meta_hash), &id);
-            env.storage()
-                .persistent()
-                .extend_ttl(&dedup_key(&owner, &meta_hash), TTL_THRESHOLD, TTL_TARGET);
+            env.storage().persistent().extend_ttl(
+                &dedup_key(&owner, &meta_hash),
+                TTL_THRESHOLD,
+                TTL_TARGET,
+            );
 
             owner_index_add(&env, &owner, id);
 
@@ -355,9 +362,11 @@ impl AssetRegistry {
 
         // Ensure owner index TTL is extended after all batch writes
         if !ids.is_empty() {
-            env.storage()
-                .persistent()
-                .extend_ttl(&owner_index_key(&owner), TTL_THRESHOLD, TTL_TARGET);
+            env.storage().persistent().extend_ttl(
+                &owner_index_key(&owner),
+                TTL_THRESHOLD,
+                TTL_TARGET,
+            );
         }
 
         // Emit batch registration event
@@ -402,7 +411,9 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
         }
         ids
     }
@@ -502,7 +513,9 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
         }
         env.storage().instance().set(&ADMIN_KEY, &admin);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Get the current admin address of the contract.
@@ -693,6 +706,7 @@ impl AssetRegistry {
     pub fn update_asset_metadata(env: Env, asset_id: u64, owner: Address, new_metadata: String) {
         ensure_not_paused(&env);
         owner.require_auth();
+        require_string_length(&new_metadata, "metadata", 256);
 
         let mut asset: Asset = env
             .storage()
@@ -782,9 +796,11 @@ impl AssetRegistry {
         env.storage()
             .persistent()
             .set(&dedup_key(&new_owner, &hash), &asset_id);
-        env.storage()
-            .persistent()
-            .extend_ttl(&dedup_key(&new_owner, &hash), TTL_THRESHOLD, TTL_TARGET);
+        env.storage().persistent().extend_ttl(
+            &dedup_key(&new_owner, &hash),
+            TTL_THRESHOLD,
+            TTL_TARGET,
+        );
 
         // Move owner index entry
         owner_index_remove(&env, &current_owner, asset_id);
@@ -853,9 +869,11 @@ impl AssetRegistry {
         env.storage()
             .persistent()
             .set(&asset_type_key(&asset_type), &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&asset_type_key(&asset_type), TTL_THRESHOLD, TTL_TARGET);
+        env.storage().persistent().extend_ttl(
+            &asset_type_key(&asset_type),
+            TTL_THRESHOLD,
+            TTL_TARGET,
+        );
         env.events().publish((ADD_TYPE_TOPIC,), (asset_type,));
     }
 
@@ -1131,9 +1149,14 @@ mod tests {
         let meta_bytes = metadata.to_xdr(&env);
         let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
         let ttl = env.as_contract(&contract_id, || {
-            env.storage().persistent().get_ttl(&dedup_key(&owner, &meta_hash))
+            env.storage()
+                .persistent()
+                .get_ttl(&dedup_key(&owner, &meta_hash))
         });
-        assert!(ttl > 0, "dedup key TTL must be extended after register_asset");
+        assert!(
+            ttl > 0,
+            "dedup key TTL must be extended after register_asset"
+        );
     }
 
     #[test]
@@ -1857,7 +1880,10 @@ mod tests {
         let key_exists = env.as_contract(&contract_id, || {
             env.storage().persistent().has(&owner_index_key(&owner))
         });
-        assert!(!key_exists, "owner index key must be absent after last asset is removed");
+        assert!(
+            !key_exists,
+            "owner index key must be absent after last asset is removed"
+        );
     }
 
     #[test]
@@ -3166,7 +3192,10 @@ mod tests {
                 .get(&type_count_key(&symbol_short!("GENSET")))
                 .unwrap_or(0)
         });
-        assert_eq!(persistent_count, 1, "type count must be in persistent storage");
+        assert_eq!(
+            persistent_count, 1,
+            "type count must be in persistent storage"
+        );
 
         // Advance ledger sequence well past the instance TTL window.
         // In the old code this would cause instance storage to return 0,
@@ -3210,7 +3239,10 @@ mod tests {
 
         // Passing attacker as deployer but deployer's auth is not present — must fail.
         let result = client.try_initialize_admin(&deployer, &attacker);
-        assert!(result.is_err(), "non-deployer must not be able to initialize");
+        assert!(
+            result.is_err(),
+            "non-deployer must not be able to initialize"
+        );
     }
 
     fn setup_with_types(env: &Env) -> (AssetRegistryClient, Address, Address) {
