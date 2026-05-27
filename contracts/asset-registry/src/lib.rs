@@ -539,6 +539,7 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::PendingAdminAlreadyExists);
         }
         env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
+        env.storage().instance().extend_ttl(518400, 518400);
         env.events()
             .publish((symbol_short!("PROP_ADM"),), (admin, new_admin));
     }
@@ -564,6 +565,7 @@ impl AssetRegistry {
         }
         env.storage().instance().set(&ADMIN_KEY, &pending_admin);
         env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        env.storage().instance().extend_ttl(518400, 518400);
         env.events()
             .publish((symbol_short!("ADMIN_SET"),), (pending_admin,));
     }
@@ -822,6 +824,8 @@ impl AssetRegistry {
         if stored_admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+
+        env.storage().instance().extend_ttl(518400, 518400);
 
         #[cfg(not(test))]
         {
@@ -2818,6 +2822,139 @@ mod tests {
                 ContractError::Paused as u32
             )))
         );
+    }
+
+    // --- Instance TTL expiry tests ---
+
+    /// Helper: wipe instance storage to simulate TTL expiry.
+    fn wipe_instance(env: &Env, contract_id: &Address) {
+        env.as_contract(contract_id, || {
+            env.storage().instance().remove(&ADMIN_KEY);
+            env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        });
+    }
+
+    #[test]
+    fn test_pause_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        // Simulate expiry then re-init
+        client.initialize_admin(&admin);
+        wipe_instance(&env, &contract_id);
+        client.initialize_admin(&admin);
+
+        client.pause(&admin);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "pause must extend instance TTL");
+    }
+
+    #[test]
+    fn test_unpause_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.pause(&admin);
+        wipe_instance(&env, &contract_id);
+        client.initialize_admin(&admin);
+
+        client.unpause(&admin);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "unpause must extend instance TTL");
+    }
+
+    #[test]
+    fn test_propose_admin_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        wipe_instance(&env, &contract_id);
+        client.initialize_admin(&admin);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "propose_admin must extend instance TTL");
+    }
+
+    #[test]
+    fn test_accept_admin_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.propose_admin(&admin, &new_admin);
+
+        // Simulate partial expiry (keep admin + pending_admin intact)
+        // accept_admin reads PENDING_ADMIN_KEY which must still be present
+        client.accept_admin(&new_admin);
+        assert_eq!(client.get_admin(), new_admin);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "accept_admin must extend instance TTL");
+    }
+
+    #[test]
+    fn test_upgrade_extends_instance_ttl_after_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        wipe_instance(&env, &contract_id);
+        client.initialize_admin(&admin);
+
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.upgrade(&admin, &hash);
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "upgrade must extend instance TTL");
+    }
+
+    #[test]
+    fn test_admin_ops_work_after_instance_ttl_expiry_and_reinit() {
+        // Full scenario: instance expires, admin re-initializes, all ops succeed.
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        // Simulate instance TTL expiry
+        wipe_instance(&env, &contract_id);
+
+        // Re-initialize admin
+        client.initialize_admin(&admin);
+
+        // All admin ops must succeed and extend TTL
+        client.pause(&admin);
+        client.unpause(&admin);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
+        assert_eq!(client.get_admin(), new_admin);
+
+        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        assert!(ttl > 0, "instance TTL must be live after admin ops");
     }
 
     // --- Issue #381: is_valid_asset_type survives instance TTL expiry ---

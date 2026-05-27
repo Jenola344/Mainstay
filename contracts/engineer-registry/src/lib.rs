@@ -411,6 +411,7 @@ impl EngineerRegistry {
         env.storage()
             .instance()
             .set(&pending_admin_key(), &new_admin);
+        env.storage().instance().extend_ttl(518400, 518400);
         env.events()
             .publish((EVENT_PROP_ADMIN,), (admin, new_admin));
     }
@@ -430,6 +431,7 @@ impl EngineerRegistry {
         pending_admin.require_auth();
         env.storage().instance().set(&admin_key(), &pending_admin);
         env.storage().instance().remove(&pending_admin_key());
+        env.storage().instance().extend_ttl(518400, 518400);
         env.events()
             .publish((symbol_short!("ADMIN_SET"),), (pending_admin,));
     }
@@ -651,6 +653,8 @@ impl EngineerRegistry {
         if stored_admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+
+        env.storage().instance().extend_ttl(518400, 518400);
 
         env.events().publish(
             (symbol_short!("UPGRADE"), admin.clone()),
