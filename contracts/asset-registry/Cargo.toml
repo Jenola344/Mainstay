@@ -11,4 +11,5 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+engineer-registry = { path = "../engineer-registry" }
 lifecycle = { path = "../lifecycle" }

@@ -946,6 +946,7 @@ mod tests {
     };
 
     use crate::AssetRegistryClient;
+    use engineer_registry;
     use lifecycle;
 
     #[test]
@@ -1120,7 +1121,7 @@ mod tests {
         let client = AssetRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
@@ -1841,7 +1842,7 @@ mod tests {
         let client = AssetRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
@@ -3043,6 +3044,7 @@ mod tests {
         env.mock_all_auths();
 
         let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(engineer_registry::EngineerRegistry, ());
         let lifecycle_id = env.register(lifecycle::Lifecycle, ());
 
         let asset_client = AssetRegistryClient::new(&env, &asset_registry_id);
@@ -3052,13 +3054,14 @@ mod tests {
         let asset_owner = Address::generate(&env);
 
         // Initialize both contracts
-        asset_client.initialize_admin(&admin);
+        asset_client.initialize_admin(&admin, &admin);
         asset_client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let lifecycle_admin = Address::generate(&env);
         lifecycle_client.initialize(
+            &lifecycle_admin,
             &asset_registry_id,
-            &Address::generate(&env),
+            &engineer_registry_id,
             &lifecycle_admin,
             &100,
         );
@@ -3088,7 +3091,7 @@ mod tests {
         let asset_client = AssetRegistryClient::new(&env, &asset_registry_id);
 
         let admin = Address::generate(&env);
-        asset_client.initialize_admin(&admin);
+        asset_client.initialize_admin(&admin, &admin);
 
         // Try to get lifecycle score for non-existent asset
         let result = asset_client.try_get_lifecycle_score(&999, &lifecycle_id);
@@ -3122,7 +3125,7 @@ mod tests {
         // then verify get_admin still returns the correct admin
         env.ledger().with_mut(|li| {
             li.sequence_number += TTL_THRESHOLD;
-            li.timestamp += TTL_THRESHOLD * 5;
+            li.timestamp += (TTL_THRESHOLD as u64) * 5;
         });
 
         // get_admin must still resolve correctly (TTL was extended at init time)
@@ -3182,6 +3185,8 @@ mod tests {
             ))),
             "remove_asset_type must be blocked when assets of that type exist"
         );
+    }
+
     #[test]
     fn test_initialize_admin_rejects_non_deployer() {
         let env = Env::default();
@@ -3206,11 +3211,13 @@ mod tests {
         // Passing attacker as deployer but deployer's auth is not present — must fail.
         let result = client.try_initialize_admin(&deployer, &attacker);
         assert!(result.is_err(), "non-deployer must not be able to initialize");
+    }
+
     fn setup_with_types(env: &Env) -> (AssetRegistryClient, Address, Address) {
         let contract_id = env.register(AssetRegistry, ());
         let client = AssetRegistryClient::new(env, &contract_id);
         let admin = Address::generate(env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
         client.add_asset_type(&admin, &symbol_short!("TURBINE"));
         (client, admin, Address::generate(env))

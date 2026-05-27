@@ -104,7 +104,7 @@ impl EngineerRegistry {
     ///
     /// # Arguments
     /// * `engineer` - The address of the engineer being registered
-    /// * `credential_hash` - Hash of the engineer's credentials/certifications
+    /// * `credential_hash` - SHA-256 hash of the engineer's credentials (32 bytes; as hex string: 64 characters)
     /// * `issuer` - The trusted issuer address registering the engineer
     /// * `validity_period` - Duration in seconds for which the credentials are valid
     ///
@@ -820,7 +820,7 @@ mod tests {
         client.initialize_admin(&admin, &admin);
 
         // Second call should fail with structured error
-        let result = client.try_initialize_admin(&admin);
+        let result = client.try_initialize_admin(&admin, &admin);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -2119,6 +2119,27 @@ mod tests {
     }
 
     #[test]
+    fn test_register_engineer_rejects_invalid_credential_hash() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let invalid_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let result = client.try_register_engineer(&engineer, &invalid_hash, &issuer, &31_536_000);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidCredentialHash as u32,
+            ))),
+        );
+    }
+
+    #[test]
     fn test_no_duplicate_in_issuer_list_after_reregistration() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2409,6 +2430,8 @@ mod tests {
 
         let result = client.try_initialize_admin(&deployer, &attacker);
         assert!(result.is_err(), "non-deployer must not be able to initialize");
+    }
+
     fn setup_engineer(
         env: &Env,
         client: &EngineerRegistryClient,
@@ -2433,7 +2456,7 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let issuer = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_trusted_issuer(&admin, &issuer);
 
         let e1 = setup_engineer(&env, &client, &issuer, 1);
@@ -2455,7 +2478,7 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let issuer = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_trusted_issuer(&admin, &issuer);
 
         let active = setup_engineer(&env, &client, &issuer, 10);
@@ -2480,7 +2503,7 @@ mod tests {
         let client = EngineerRegistryClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let issuer = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_trusted_issuer(&admin, &issuer);
 
         let e1 = setup_engineer(&env, &client, &issuer, 20);
