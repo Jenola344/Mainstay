@@ -54,6 +54,12 @@ const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
 const MIN_VALIDITY_PERIOD: u64 = 86_400;
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 
+
+/// Soroban persistent-storage TTL constants.
+/// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
+const TTL_THRESHOLD: u32 = 518_400;
+const TTL_TARGET: u32 = 518_400;
+
 fn is_paused(env: &Env) -> bool {
     env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
 }
@@ -156,7 +162,7 @@ impl EngineerRegistry {
             .set(&engineer_key(&engineer), &record);
         env.storage()
             .persistent()
-            .extend_ttl(&engineer_key(&engineer), 518400, 518400);
+            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
 
         // Track issuer → engineers mapping (avoid duplicates on re-registration after revoke)
         let mut list: Vec<Address> = env
@@ -172,7 +178,7 @@ impl EngineerRegistry {
             .set(&issuer_engineers_key(&issuer), &list);
         env.storage()
             .persistent()
-            .extend_ttl(&issuer_engineers_key(&issuer), 518400, 518400);
+            .extend_ttl(&issuer_engineers_key(&issuer), TTL_THRESHOLD, TTL_TARGET);
 
         // Emit engineer registration event
         env.events().publish(
@@ -224,7 +230,7 @@ impl EngineerRegistry {
         // Extend TTL before write to ensure consistency even on near-expired entries
         env.storage()
             .persistent()
-            .extend_ttl(&engineer_key(&engineer), 518400, 518400);
+            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
         record.active = false;
         env.storage()
             .persistent()
@@ -274,7 +280,7 @@ impl EngineerRegistry {
         record.expires_at = renewal_base + new_validity_period;
         env.storage()
             .persistent()
-            .extend_ttl(&engineer_key(&engineer), 518400, 518400);
+            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
         env.storage()
             .persistent()
             .set(&engineer_key(&engineer), &record);
@@ -345,7 +351,7 @@ impl EngineerRegistry {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
         }
         env.storage().instance().set(&admin_key(), &admin);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Get the current admin address of the contract.
@@ -420,7 +426,7 @@ impl EngineerRegistry {
         env.storage().persistent().set(&PAUSED_KEY, &true);
         env.storage()
             .persistent()
-            .extend_ttl(&PAUSED_KEY, 518400, 518400);
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((symbol_short!("PAUSED"),), (admin,));
     }
 
@@ -437,7 +443,7 @@ impl EngineerRegistry {
         env.storage().persistent().set(&PAUSED_KEY, &false);
         env.storage()
             .persistent()
-            .extend_ttl(&PAUSED_KEY, 518400, 518400);
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((symbol_short!("UNPAUSED"),), (admin,));
     }
 
@@ -501,11 +507,11 @@ impl EngineerRegistry {
         if !list.contains(issuer.clone()) {
             list.push_back(issuer.clone());
             env.storage().instance().set(&issuer_list_key(), &list);
-            env.storage().instance().extend_ttl(518400, 518400);
+            env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
             env.events()
                 .publish((symbol_short!("ISS_ADD"), admin), (issuer,));
         } else {
-            env.storage().instance().extend_ttl(518400, 518400);
+            env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
         }
     }
 
@@ -549,7 +555,7 @@ impl EngineerRegistry {
             }
         }
         env.storage().instance().set(&issuer_list_key(), &new_list);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
 
         // Revoke all active engineers registered by this issuer
         let engineers: Vec<Address> = env
@@ -567,7 +573,7 @@ impl EngineerRegistry {
                     record.active = false;
                     env.storage()
                         .persistent()
-                        .extend_ttl(&engineer_key(&engineer), 518400, 518400);
+                        .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
                     env.storage()
                         .persistent()
                         .set(&engineer_key(&engineer), &record);

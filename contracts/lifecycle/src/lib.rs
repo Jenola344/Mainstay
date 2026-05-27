@@ -83,6 +83,11 @@ const EVENT_XFER: Symbol = symbol_short!("XFER");
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 const EVENT_ADMIN_SET: Symbol = symbol_short!("ADMIN_SET");
 
+/// Soroban persistent-storage TTL constants.
+/// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
+const TTL_THRESHOLD: u32 = 518_400;
+const TTL_TARGET: u32 = 518_400;
+
 fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
 }
@@ -109,7 +114,7 @@ fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_history: 
     }
     history.push_back(entry);
     env.storage().persistent().set(&key, &history);
-    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn last_update_key(asset_id: u64) -> (Symbol, u64) {
@@ -145,7 +150,7 @@ fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_histor
     }
 
     env.storage().persistent().set(&key, &ids);
-    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn engineer_history_remove(env: &Env, engineer: &Address, asset_id: u64) {
@@ -161,7 +166,7 @@ fn engineer_history_remove(env: &Env, engineer: &Address, asset_id: u64) {
         if let Some(i) = index {
             ids.remove(i);
             env.storage().persistent().set(&key, &ids);
-            env.storage().persistent().extend_ttl(&key, 518400, 518400);
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
         }
     }
 }
@@ -184,14 +189,14 @@ fn set_asset_registry_addr(env: &Env, addr: &Address) {
     env.storage().persistent().set(&ASSET_REGISTRY, addr);
     env.storage()
         .persistent()
-        .extend_ttl(&ASSET_REGISTRY, 518400, 518400);
+        .extend_ttl(&ASSET_REGISTRY, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn set_engineer_registry_addr(env: &Env, addr: &Address) {
     env.storage().persistent().set(&ENG_REGISTRY, addr);
     env.storage()
         .persistent()
-        .extend_ttl(&ENG_REGISTRY, 518400, 518400);
+        .extend_ttl(&ENG_REGISTRY, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn is_zero_address(env: &Env, addr: &Address) -> bool {
@@ -256,7 +261,7 @@ fn apply_decay(
         if env.storage().persistent().has(&last_update_key(asset_id)) {
             env.storage()
                 .persistent()
-                .extend_ttl(&last_update_key(asset_id), 518400, 518400);
+                .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         }
         return 0;
     }
@@ -281,10 +286,10 @@ fn apply_decay(
     if decay_intervals == 0 && !update_on_zero_interval {
         env.storage()
             .persistent()
-            .extend_ttl(&score_key(asset_id), 518400, 518400);
+            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         env.storage()
             .persistent()
-            .extend_ttl(&last_update_key(asset_id), 518400, 518400);
+            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         return current_score;
     }
 
@@ -296,13 +301,13 @@ fn apply_decay(
         .set(&score_key(asset_id), &new_score);
     env.storage()
         .persistent()
-        .extend_ttl(&score_key(asset_id), 518400, 518400);
+        .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
     env.storage()
         .persistent()
         .set(&last_update_key(asset_id), &current_time);
     env.storage()
         .persistent()
-        .extend_ttl(&last_update_key(asset_id), 518400, 518400);
+        .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
     score_history_push(
         env,
@@ -425,7 +430,7 @@ impl Lifecycle {
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
             .persistent()
-            .extend_ttl(&CONFIG, 518400, 518400);
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
 
         env.events()
             .publish((EVENT_INIT,), (asset_registry, engineer_registry, admin));
@@ -452,7 +457,7 @@ impl Lifecycle {
         env.storage().persistent().set(&PAUSED_KEY, &true);
         env.storage()
             .persistent()
-            .extend_ttl(&PAUSED_KEY, 518400, 518400);
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((symbol_short!("PAUSED"),), (admin,));
     }
 
@@ -477,7 +482,7 @@ impl Lifecycle {
         env.storage().persistent().set(&PAUSED_KEY, &false);
         env.storage()
             .persistent()
-            .extend_ttl(&PAUSED_KEY, 518400, 518400);
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish((symbol_short!("UNPAUSED"),), (admin,));
     }
 
@@ -541,7 +546,7 @@ impl Lifecycle {
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
             .persistent()
-            .extend_ttl(&CONFIG, 518400, 518400);
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
         env.storage().instance().remove(&PENDING_ADMIN_KEY);
         env.events().publish((EVENT_ADMIN_SET,), (pending_admin,));
     }
@@ -579,7 +584,7 @@ impl Lifecycle {
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
             .persistent()
-            .extend_ttl(&CONFIG, 518400, 518400);
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish(
             (symbol_short!("CFG_UPD"),),
             (old_increment, score_increment),
@@ -632,7 +637,7 @@ impl Lifecycle {
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
             .persistent()
-            .extend_ttl(&CONFIG, 518400, 518400);
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Admin-only function to update the eligibility threshold for collateral scoring.
@@ -666,7 +671,7 @@ impl Lifecycle {
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
             .persistent()
-            .extend_ttl(&CONFIG, 518400, 518400);
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
         env.events()
             .publish((symbol_short!("CFG_UPD"),), (old_threshold, threshold));
     }
@@ -709,7 +714,7 @@ impl Lifecycle {
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
             .persistent()
-            .extend_ttl(&CONFIG, 518400, 518400);
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
 
         env.events()
             .publish((symbol_short!("UPD_MAX"), admin), new_max);
@@ -746,7 +751,7 @@ impl Lifecycle {
         env.storage().persistent().set(&CONFIG, &config);
         env.storage()
             .persistent()
-            .extend_ttl(&CONFIG, 518400, 518400);
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
 
         env.events()
             .publish((symbol_short!("UPD_NOTES"), admin), new_max);
@@ -829,7 +834,7 @@ impl Lifecycle {
             .set(&history_key(asset_id), &history);
         env.storage()
             .persistent()
-            .extend_ttl(&history_key(asset_id), 518400, 518400);
+            .extend_ttl(&history_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         engineer_history_add(&env, &engineer, asset_id, config.max_history);
 
@@ -845,7 +850,7 @@ impl Lifecycle {
             .set(&score_key(asset_id), &new_score);
         env.storage()
             .persistent()
-            .extend_ttl(&score_key(asset_id), 518400, 518400);
+            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         // Append (timestamp, score) snapshot to score history
         score_history_push(
@@ -864,7 +869,7 @@ impl Lifecycle {
             .set(&last_update_key(asset_id), &timestamp);
         env.storage()
             .persistent()
-            .extend_ttl(&last_update_key(asset_id), 518400, 518400);
+            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         // Emit maintenance submission event
         env.events()
@@ -932,7 +937,7 @@ impl Lifecycle {
             .set(&history_key(asset_id), &history);
         env.storage()
             .persistent()
-            .extend_ttl(&history_key(asset_id), 518400, 518400);
+            .extend_ttl(&history_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         env.events().publish(
             (EVENT_XFER, asset_id),
@@ -1035,17 +1040,17 @@ impl Lifecycle {
             .set(&history_key(asset_id), &history);
         env.storage()
             .persistent()
-            .extend_ttl(&history_key(asset_id), 518400, 518400);
+            .extend_ttl(&history_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         env.storage().persistent().set(&score_key(asset_id), &score);
         env.storage()
             .persistent()
-            .extend_ttl(&score_key(asset_id), 518400, 518400);
+            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         env.storage()
             .persistent()
             .set(&last_update_key(asset_id), &timestamp);
         env.storage()
             .persistent()
-            .extend_ttl(&last_update_key(asset_id), 518400, 518400);
+            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Apply time-based decay to an asset's collateral score.
@@ -1515,13 +1520,13 @@ impl Lifecycle {
         env.storage().persistent().set(&score_key(asset_id), &0u32);
         env.storage()
             .persistent()
-            .extend_ttl(&score_key(asset_id), 518400, 518400);
+            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         env.storage()
             .persistent()
             .set(&last_update_key(asset_id), &now);
         env.storage()
             .persistent()
-            .extend_ttl(&last_update_key(asset_id), 518400, 518400);
+            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
         score_history_push(
             &env,
             asset_id,
@@ -1609,7 +1614,7 @@ impl Lifecycle {
                 env.storage().persistent().set(&history_key, &pruned);
                 env.storage()
                     .persistent()
-                    .extend_ttl(&history_key, 518400, 518400);
+                    .extend_ttl(&history_key, TTL_THRESHOLD, TTL_TARGET);
             }
         }
 
@@ -1632,7 +1637,7 @@ impl Lifecycle {
                     .set(&score_history_key_val, &pruned);
                 env.storage()
                     .persistent()
-                    .extend_ttl(&score_history_key_val, 518400, 518400);
+                    .extend_ttl(&score_history_key_val, TTL_THRESHOLD, TTL_TARGET);
             }
         }
 
