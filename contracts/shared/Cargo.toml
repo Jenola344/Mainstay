@@ -1,16 +1,13 @@
 [package]
-name = "asset-registry"
+name = "shared"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-shared = { path = "../shared" }
 
 [dev-dependencies]
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
-engineer-registry = { path = "../engineer-registry" }
-lifecycle = { path = "../lifecycle" }

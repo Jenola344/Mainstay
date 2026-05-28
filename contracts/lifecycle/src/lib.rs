@@ -1,12 +1,16 @@
 #![no_std]
 
+use shared::validation::{
+    require_non_empty_vec, require_positive_u32, require_positive_u64, require_string_length,
+};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     BytesN, Env, String, Symbol, Vec,
 };
 
 #[contracterror]
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
 pub enum ContractError {
     NoMaintenanceHistory = 1,
     UnauthorizedEngineer = 2,
@@ -23,6 +27,10 @@ pub enum ContractError {
     SameRegistryAddress = 13,
     IndexOutOfBounds = 14,
     UnauthorizedOwner = 15,
+    TimelockNotExpired = 16,
+    ProposalNotFound = 17,
+    EngineerNotAuthorized = 16,
+    ScoreOverflow = 16,
 }
 
 #[contracttype]
@@ -62,6 +70,13 @@ pub struct Config {
     pub max_notes_length: u32,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockProposal {
+    pub proposed_at: u64,
+    pub executed: bool,
+}
+
 const ASSET_REGISTRY: Symbol = symbol_short!("REGISTRY");
 const ENG_REGISTRY: Symbol = symbol_short!("ENG_REG");
 const CONFIG: Symbol = symbol_short!("CONFIG");
@@ -73,10 +88,16 @@ const DEFAULT_DECAY_RATE: u32 = 5;
 const DEFAULT_DECAY_INTERVAL: u64 = 2592000; // 30 days in seconds
 const DEFAULT_ELIGIBILITY_THRESHOLD: u32 = 50;
 const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
+const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Minimum score returned for an asset that has at least one maintenance record.
 /// Prevents decay from making a legitimately-maintained asset indistinguishable
 /// from one with no history at all.
 const MIN_SCORE_WITH_HISTORY: u32 = 1;
+/// Maximum age in ledgers for maintenance record recency weighting.
+/// Records older than this contribute zero to the collateral score.
+/// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
+/// Older records still contribute nothing, newer records are weighted linearly.
+const MAX_AGE_LEDGERS: u64 = 518_400;
 
 const EVENT_INIT: Symbol = symbol_short!("INIT");
 const EVENT_MAINT: Symbol = symbol_short!("MAINT");
@@ -95,6 +116,10 @@ const TTL_TARGET: u32 = 518_400;
 
 fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
+}
+
+fn timelock_key(op: Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("TL_PROP"), op)
 }
 
 fn score_key(asset_id: u64) -> (Symbol, u64) {
@@ -130,6 +155,21 @@ fn last_update_key(asset_id: u64) -> (Symbol, u64) {
 
 fn engineer_history_key(engineer: &Address) -> (Symbol, Address) {
     (symbol_short!("ENG_HIST"), engineer.clone())
+}
+
+fn engineer_auth_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("ENG_AUTH"), asset_id, engineer.clone())
+}
+
+fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
+    let authorized: bool = env
+        .storage()
+        .persistent()
+        .get(&engineer_auth_key(asset_id, engineer))
+        .unwrap_or(false);
+    if !authorized {
+        panic_with_error!(env, ContractError::EngineerNotAuthorized);
+    }
 }
 
 fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_history: u32) {
@@ -228,31 +268,112 @@ fn ensure_not_paused(env: &Env) {
     }
 }
 
-/// Compute the decayed score without writing anything to storage.
-/// Returns the score that *would* result from applying decay at the current ledger time.
-fn compute_decay(env: &Env, asset_id: u64) -> u32 {
-    let current_score: u32 = env
-        .storage()
-        .persistent()
-        .get(&score_key(asset_id))
-        .unwrap_or(0u32);
-    if current_score == 0 {
-        return 0;
-    }
-    let last_update: u64 = env
-        .storage()
-        .persistent()
-        .get(&last_update_key(asset_id))
-        .unwrap_or(0u64);
+fn require_admin(env: &Env, admin: &Address) {
+    admin.require_auth();
     let config: Config = env
         .storage()
         .persistent()
         .get(&CONFIG)
         .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
-    let time_elapsed = env.ledger().timestamp().saturating_sub(last_update);
-    let decay_intervals = time_elapsed / config.decay_interval;
-    let total_decay = (decay_intervals as u32) * config.decay_rate;
-    current_score.saturating_sub(total_decay)
+    if config.admin != *admin {
+        panic_with_error!(env, ContractError::UnauthorizedAdmin);
+    }
+}
+
+fn store_timelock(env: &Env, op: Symbol) {
+    let key = timelock_key(op);
+    env.storage().persistent().set(
+        &key,
+        &TimelockProposal {
+            proposed_at: env.ledger().timestamp(),
+            executed: false,
+        },
+    );
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+}
+
+fn require_timelock_ready(env: &Env, op: Symbol) {
+    let key = timelock_key(op);
+    let mut proposal: TimelockProposal = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::ProposalNotFound));
+    if proposal.executed {
+        panic_with_error!(env, ContractError::ProposalNotFound);
+    }
+    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
+        panic_with_error!(env, ContractError::TimelockNotExpired);
+    }
+    proposal.executed = true;
+    env.storage().persistent().set(&key, &proposal);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+}
+
+/// Compute the decayed score without writing anything to storage.
+/// Returns the score that *would* result from applying decay at the current ledger time.
+/// Compute collateral score by summing maintenance records weighted by recency.
+/// Uses a linear decay model where recent records contribute more than older ones.
+/// Each record's contribution = score_increment * recency_weight where:
+///   recency_weight = max(0, MAX_AGE_LEDGERS - (current_timestamp_in_ledgers - record_timestamp_in_ledgers)) / MAX_AGE_LEDGERS
+/// Timestamps are converted to ledgers (1 ledger ≈ 5 seconds) for recency calculation.
+/// The score is calculated fresh from all maintenance records to reflect actual maintenance recency.
+/// Returns the score capped at 100.
+fn compute_decay(env: &Env, asset_id: u64) -> u32 {
+    let history: Vec<MaintenanceRecord> = env
+        .storage()
+        .persistent()
+        .get(&history_key(asset_id))
+        .unwrap_or(Vec::new(env));
+
+    if history.is_empty() {
+        return 0;
+    }
+
+    let config: Config = env
+        .storage()
+        .persistent()
+        .get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
+
+    // Get current time in seconds and convert to ledgers (1 ledger ≈ 5 seconds)
+    let current_time_seconds = env.ledger().timestamp();
+    let current_ledger = current_time_seconds / 5;
+    let mut total_score: u32 = 0;
+
+    for record in history.iter() {
+        // Convert record timestamp to ledgers
+        let record_ledger = record.timestamp / 5;
+
+        // Calculate age in ledgers
+        let age_ledgers = current_ledger.saturating_sub(record_ledger);
+
+        // Calculate recency weight using linear decay: most recent records have weight 1,
+        // records at MAX_AGE_LEDGERS have weight 0, older records contribute nothing
+        let recency_weight = if age_ledgers >= MAX_AGE_LEDGERS {
+            0u64
+        } else {
+            MAX_AGE_LEDGERS - age_ledgers
+        };
+
+        // Each record contributes score_increment, weighted by recency
+        let base_score = config.score_increment as u64;
+
+        // Calculate weighted contribution: (score_increment * recency_weight) / MAX_AGE_LEDGERS
+        let contribution = (base_score * recency_weight) / MAX_AGE_LEDGERS;
+
+        // Add to total using checked_add to prevent overflow (panics with ScoreOverflow error)
+        total_score = total_score
+            .checked_add(contribution as u32)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::ScoreOverflow));
+    }
+
+    // Cap score at 100 to match eligibility threshold expectations
+    total_score.min(100)
 }
 
 fn apply_decay(
@@ -372,6 +493,9 @@ fn get_task_weight(env: &Env, task_type: &Symbol) -> u32 {
 }
 
 fn validate_notes_length(env: &Env, notes: &soroban_sdk::String, max: u32) {
+    if notes.is_empty() {
+        panic_with_error!(env, ContractError::InvalidConfig);
+    }
     if notes.len() > max {
         panic_with_error!(env, ContractError::InvalidConfig);
     }
@@ -401,6 +525,91 @@ pub struct Lifecycle;
 
 #[contractimpl]
 impl Lifecycle {
+    pub fn propose_config_update(env: Env, admin: Address, op: Symbol) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+        store_timelock(&env, op);
+    }
+
+    pub fn execute_update_score_increment(env: Env, admin: Address, score_increment: u32) {
+        require_timelock_ready(&env, symbol_short!("SC_INC"));
+        Self::update_score_increment(env, admin, score_increment);
+    }
+
+    pub fn execute_update_decay_config(
+        env: Env,
+        admin: Address,
+        decay_rate: u32,
+        decay_interval: u64,
+    ) {
+        require_timelock_ready(&env, symbol_short!("DEC_CFG"));
+        Self::update_decay_config(env, admin, decay_rate, decay_interval);
+    }
+
+    pub fn execute_update_eligibility(env: Env, admin: Address, threshold: u32) {
+        require_timelock_ready(&env, symbol_short!("ELIG"));
+        Self::update_eligibility_threshold(env, admin, threshold);
+    }
+
+    pub fn execute_update_max_history(env: Env, admin: Address, new_max: u32) {
+        require_timelock_ready(&env, symbol_short!("MAX_HIST"));
+        Self::update_max_history(env, admin, new_max);
+    }
+
+    pub fn execute_update_max_notes_length(env: Env, admin: Address, new_max: u32) {
+        require_timelock_ready(&env, symbol_short!("MAX_NOTE"));
+        Self::update_max_notes_length(env, admin, new_max);
+    }
+
+    pub fn execute_update_asset_registry(env: Env, admin: Address, new_registry: Address) {
+        require_timelock_ready(&env, symbol_short!("AST_REG"));
+        Self::update_asset_registry(env, admin, new_registry);
+    }
+
+    pub fn execute_update_engineer_registry(env: Env, admin: Address, new_registry: Address) {
+        require_timelock_ready(&env, symbol_short!("ENG_REG"));
+        Self::update_engineer_registry(env, admin, new_registry);
+    /// Owner-approved per-asset authorization for maintenance submissions.
+    ///
+    /// A verified engineer must also be explicitly authorized by the current asset owner
+    /// before submitting maintenance for that asset.
+    pub fn authorize_engineer(env: Env, owner: Address, asset_id: u64, engineer: Address) {
+        ensure_not_paused(&env);
+        owner.require_auth();
+
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset =
+            asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.owner != owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        let key = engineer_auth_key(asset_id, &engineer);
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Revoke an engineer's owner-approved authorization for a specific asset.
+    pub fn revoke_engineer_auth(env: Env, owner: Address, asset_id: u64, engineer: Address) {
+        ensure_not_paused(&env);
+        owner.require_auth();
+
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset =
+            asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.owner != owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&engineer_auth_key(asset_id, &engineer));
+    }
+
     /// Initialize the lifecycle contract with registry addresses and configuration.
     /// Must be called once after deployment to bind dependent registries.
     ///
@@ -424,6 +633,9 @@ impl Lifecycle {
         deployer.require_auth();
         if env.storage().persistent().has(&CONFIG) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
+        }
+        if max_history > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
         }
         if asset_registry == engineer_registry {
             panic_with_error!(&env, ContractError::InvalidConfig);
@@ -605,6 +817,7 @@ impl Lifecycle {
         if score_increment == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        require_positive_u32(score_increment, "score_increment");
 
         let mut config: Config = env
             .storage()
@@ -655,6 +868,8 @@ impl Lifecycle {
         if decay_rate == 0 || decay_interval == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        require_positive_u32(decay_rate, "decay_rate");
+        require_positive_u64(decay_interval, "decay_interval");
 
         let mut config: Config = env
             .storage()
@@ -720,6 +935,7 @@ impl Lifecycle {
         if threshold == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        require_positive_u32(threshold, "threshold");
 
         let old_threshold = config.eligibility_threshold;
         config.eligibility_threshold = threshold;
@@ -764,6 +980,7 @@ impl Lifecycle {
         if new_max == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        require_positive_u32(new_max, "max_history");
 
         let mut config: Config = env
             .storage()
@@ -810,6 +1027,7 @@ impl Lifecycle {
         if new_max == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        require_positive_u32(new_max, "max_notes_length");
 
         let mut config: Config = env
             .storage()
@@ -896,9 +1114,12 @@ impl Lifecycle {
         // Cross-check engineer credential
         let registry_id = get_engineer_registry_addr(&env);
         let registry = engineer_registry::EngineerRegistryClient::new(&env, &registry_id);
-        if !registry.verify_engineer(&engineer) {
-            panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+        match registry.verify_engineer(&engineer) {
+            None => panic_with_error!(&env, engineer_registry::ContractError::EngineerNotFound),
+            Some(false) => panic_with_error!(&env, ContractError::UnauthorizedEngineer),
+            Some(true) => {},
         }
+        require_engineer_authorized(&env, asset_id, &engineer);
 
         let timestamp = env.ledger().timestamp();
 
@@ -920,21 +1141,10 @@ impl Lifecycle {
 
         engineer_history_add(&env, &engineer, asset_id, config.max_history);
 
-        // Update collateral score
-        let score: u32 = env
-            .storage()
-            .persistent()
-            .get(&score_key(asset_id))
-            .unwrap_or(0u32);
-        let new_score = (score + config.score_increment).min(100);
-        env.storage()
-            .persistent()
-            .set(&score_key(asset_id), &new_score);
-        env.storage()
-            .persistent()
-            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        // Calculate collateral score from all records weighted by recency
+        let new_score = compute_decay(&env, asset_id);
 
-        // Append (timestamp, score) snapshot to score history
+        // Append (timestamp, score) snapshot to score history for historical tracking
         score_history_push(
             &env,
             asset_id,
@@ -956,8 +1166,10 @@ impl Lifecycle {
         );
 
         // Emit maintenance submission event
-        env.events()
-            .publish((EVENT_MAINT, asset_id), (task_type, engineer, timestamp));
+        env.events().publish(
+            (symbol_short!("maint"),),
+            (asset_id, engineer.clone(), task_type, timestamp),
+        );
     }
 
     /// Record an ownership transfer in the asset's maintenance history.
@@ -1074,7 +1286,9 @@ impl Lifecycle {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
 
         // Validate records early before cross-contract calls
+        require_non_empty_vec(&records, "records");
         for record in records.iter() {
+            require_string_length(&record.notes, "notes", config.max_notes_length);
             validate_notes_length(&env, &record.notes, config.max_notes_length);
             // Validate task type is known
             let _ = get_task_weight(&env, &record.task_type);
@@ -1088,9 +1302,12 @@ impl Lifecycle {
         let engineer_registry = get_engineer_registry_addr(&env);
         let engineer_registry_client =
             engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry);
-        if !engineer_registry_client.verify_engineer(&engineer) {
-            panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+        match engineer_registry_client.verify_engineer(&engineer) {
+            None => panic_with_error!(&env, engineer_registry::ContractError::EngineerNotFound),
+            Some(false) => panic_with_error!(&env, ContractError::UnauthorizedEngineer),
+            Some(true) => {},
         }
+        require_engineer_authorized(&env, asset_id, &engineer);
 
         let mut history: Vec<MaintenanceRecord> = env
             .storage()
@@ -1451,7 +1668,8 @@ impl Lifecycle {
     /// # Returns
     /// A Vec containing the **first 100** asset IDs this engineer has worked on.
     /// If the engineer has more than 100 entries the result is silently truncated —
-    /// call [`get_engineer_maintenance_history_count`] to check the total, then use
+    /// call [`get_eng_maint_hist_count`] to check the total, then use
+    /// call [`get_eng_maint_count`] to check the total, then use
     /// [`get_eng_history_page`] with `offset`/`limit` to retrieve the full history.
     pub fn get_engineer_maintenance_history(env: Env, engineer: Address) -> Vec<u64> {
         let history: Vec<u64> = env
@@ -1482,6 +1700,9 @@ impl Lifecycle {
     ///
     /// # Returns
     /// Total number of entries in the engineer's maintenance history.
+    pub fn get_eng_maint_hist_count(env: Env, engineer: Address) -> u32 {
+    pub fn get_engineer_history_count(env: Env, engineer: Address) -> u32 {
+    pub fn get_eng_maint_count(env: Env, engineer: Address) -> u32 {
     pub fn eng_maintenance_history_count(env: Env, engineer: Address) -> u32 {
         let history: Vec<u64> = env
             .storage()
@@ -1957,6 +2178,18 @@ mod tests {
         )
     }
 
+    fn register_asset_for_owner(
+        env: &Env,
+        registry_client: &AssetRegistryClient,
+        owner: &Address,
+    ) -> u64 {
+        registry_client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(env, "Caterpillar 3516"),
+            owner,
+        )
+    }
+
     fn register_engineer(env: &Env, registry_client: &EngineerRegistryClient) -> Address {
         let engineer = Address::generate(env);
         let issuer = Address::generate(env);
@@ -1989,6 +2222,70 @@ mod tests {
 
         assert_eq!(client.get_collateral_score(&asset_id), 50);
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 10);
+    }
+
+    #[test]
+    fn test_authorized_engineer_can_submit_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let owner = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry_client, &owner);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        client.authorize_engineer(&owner, &asset_id, &engineer);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "authorized"),
+            &engineer,
+        );
+
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
+    }
+
+    #[test]
+    fn test_unauthorized_engineer_cannot_submit_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "unauthorized"),
+            &engineer,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::EngineerNotAuthorized as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_non_owner_cannot_authorize_engineer() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let owner = Address::generate(&env);
+        let rogue = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry_client, &owner);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let result = client.try_authorize_engineer(&rogue, &asset_id, &engineer);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedOwner as u32,
+            ))),
+        );
     }
 
     #[test]
@@ -3056,15 +3353,40 @@ mod tests {
         let asset_id = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
 
+        let task_type = symbol_short!("OIL_CHG");
+        let timestamp = env.ledger().timestamp();
         client.submit_maintenance(
             &asset_id,
-            &symbol_short!("OIL_CHG"),
+            &task_type,
             &String::from_str(&env, "Routine"),
             &engineer,
         );
 
+        use soroban_sdk::{FromVal, TryIntoVal};
+        let maint_topic = symbol_short!("maint");
         let events = env.events().all();
-        assert!(events.len() > 0);
+        let (_, topics, data) = events
+            .iter()
+            .find(|(_, topics, _)| {
+                topics.get(0).map_or(false, |v| {
+                    Symbol::from_val(&env, &v) == maint_topic
+                })
+            })
+            .expect("maint event not emitted");
+
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, maint_topic);
+
+        let (emitted_asset_id, emitted_engineer, emitted_task_type, emitted_timestamp): (
+            u64,
+            Address,
+            Symbol,
+            u64,
+        ) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_asset_id, asset_id);
+        assert_eq!(emitted_engineer, engineer);
+        assert_eq!(emitted_task_type, task_type);
+        assert_eq!(emitted_timestamp, timestamp);
     }
 
     #[test]
@@ -3137,6 +3459,7 @@ mod tests {
         let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
         let result =
             lifecycle.try_initialize(&admin, &same_registry_id, &same_registry_id, &admin, &0u32);
+        let result = lifecycle.try_initialize(&admin, &same_registry_id, &same_registry_id, &admin, &0u32);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -4285,6 +4608,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_submit_maintenance_revoked_engineer_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        assert!(engineer_registry_client.verify_engineer(&engineer));
+        engineer_registry_client.revoke_credential(&engineer);
+        assert!(!engineer_registry_client.verify_engineer(&engineer));
+
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Post-revocation attempt"),
+            &engineer,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedEngineer as u32,
+            ))),
+        );
+    }
+
     /// Issue #128: revoked engineer cannot submit, but can after re-registration with a new credential.
     #[test]
     fn test_submit_maintenance_revoked_then_reregistered_engineer() {
@@ -4306,7 +4656,7 @@ mod tests {
 
         // Revoke the credential
         engineer_registry_client.revoke_credential(&engineer);
-        assert!(!engineer_registry_client.verify_engineer(&engineer));
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(false));
 
         // Attempt to submit maintenance ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â must fail with UnauthorizedEngineer
         let result = client.try_submit_maintenance(
@@ -4325,7 +4675,7 @@ mod tests {
         // Re-register the same engineer with a new credential hash
         let hash_v2 = BytesN::from_array(&env, &[2u8; 32]);
         engineer_registry_client.register_engineer(&engineer, &hash_v2, &issuer, &31_536_000);
-        assert!(engineer_registry_client.verify_engineer(&engineer));
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(true));
 
         // Submission must now succeed
         client.submit_maintenance(
@@ -4358,14 +4708,14 @@ mod tests {
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &1000);
 
         // Verify engineer is initially valid
-        assert!(engineer_registry_client.verify_engineer(&engineer));
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(true));
 
         // Advance ledger past expiry (1001 seconds)
         env.ledger()
             .with_mut(|li| li.timestamp = li.timestamp + 1001);
 
         // Verify engineer is now expired
-        assert!(!engineer_registry_client.verify_engineer(&engineer));
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(false));
 
         // Attempt submit_maintenance and assert UnauthorizedEngineer is returned
         let result = client.try_submit_maintenance(
@@ -4406,12 +4756,12 @@ mod tests {
         // Register with validity_period = 100 seconds
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &100);
 
-        assert!(engineer_registry_client.verify_engineer(&engineer));
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(true));
 
         // Advance ledger by 101 seconds ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â credential is now expired
         env.ledger().with_mut(|li| li.timestamp += 101);
 
-        assert!(!engineer_registry_client.verify_engineer(&engineer));
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(false));
 
         let result = client.try_submit_maintenance(
             &asset_id,
@@ -4451,12 +4801,12 @@ mod tests {
         // Register with validity_period = 100 seconds
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &100);
 
-        assert!(engineer_registry_client.verify_engineer(&engineer));
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(true));
 
         // Advance ledger by 101 seconds ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â credential is now expired
         env.ledger().with_mut(|li| li.timestamp += 101);
 
-        assert!(!engineer_registry_client.verify_engineer(&engineer));
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(false));
 
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
@@ -4504,7 +4854,7 @@ mod tests {
             &issuer,
             &31_536_000,
         );
-        assert!(engineer_registry.verify_engineer(&engineer));
+        assert_eq!(engineer_registry.verify_engineer(&engineer), Some(true));
 
         // 3. Submit 10 maintenance records (default score_increment = 5pts each)
         for i in 0..10u32 {
@@ -4909,6 +5259,8 @@ mod tests {
         let history = client.get_engineer_maintenance_history(&engineer);
         assert_eq!(history.len(), 100u32);
         // confirm the full count is accessible via the count helper
+        assert_eq!(client.get_eng_maint_hist_count(&engineer), 101u32);
+        assert_eq!(client.get_eng_maint_count(&engineer), 101u32);
         assert_eq!(client.eng_maintenance_history_count(&engineer), 101u32);
     }
 
@@ -5857,7 +6209,7 @@ mod tests {
             &issuer,
             &31_536_000,
         );
-        assert!(engineer_registry.verify_engineer(&engineer));
+        assert_eq!(engineer_registry.verify_engineer(&engineer), Some(true));
 
         // 4. Submit maintenance ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â 10 ÃƒÆ’Ã¢â‚¬â€ OVERHAUL (5 pts each) = 50, eligible
         for _ in 0..10 {
@@ -6057,6 +6409,10 @@ mod tests {
         let xfer_event = events
             .iter()
             .find(|(_, topics, _)| {
+                use soroban_sdk::FromVal;
+                topics.get(0).map_or(false, |v| {
+                    Symbol::from_val(&env, &v) == symbol_short!("XFER")
+                })
                 topics
                     .get(0)
                     .and_then(|v| v.try_into_val(&env).ok())
@@ -6400,6 +6756,82 @@ mod tests {
             client.get_collateral_score(&asset_id),
             1,
             "asset with maintenance history must not score 0 after decay"
+        );
+    }
+
+    #[test]
+    fn test_collateral_score_accounts_for_maintenance_recency() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id_recent = register_asset(&env, &asset_registry_client);
+        let asset_id_old = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Submit maintenance for both assets at the same time
+        let initial_timestamp = env.ledger().timestamp();
+        client.submit_maintenance(
+            &asset_id_recent,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "recent maintenance"),
+            &engineer,
+        );
+        client.submit_maintenance(
+            &asset_id_old,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "old maintenance"),
+            &engineer,
+        );
+
+        // Both should have same score initially (score_increment = 5 for a recent record)
+        let score_initial_recent = client.get_collateral_score(&asset_id_recent);
+        let score_initial_old = client.get_collateral_score(&asset_id_old);
+        assert_eq!(score_initial_recent, score_initial_old, "identical assets should have same initial score");
+
+        // Advance time by 15 days (half of MAX_AGE_LEDGERS = 30 days)
+        // Record age = 15 days → recency_weight = (30 - 15) / 30 = 0.5
+        // For asset_id_old: score = 5 * 0.5 = 2.5 → 2
+        env.ledger().with_mut(|li| {
+            li.timestamp = initial_timestamp + 15 * 86_400; // 15 days later
+        });
+
+        let score_after_15d_old = client.get_collateral_score(&asset_id_old);
+        assert!(
+            score_after_15d_old < score_initial_old,
+            "old maintenance should score lower due to age weighting"
+        );
+
+        // Add a fresh maintenance record to asset_id_recent to increase score
+        client.submit_maintenance(
+            &asset_id_recent,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "recent maintenance again"),
+            &engineer,
+        );
+        let score_after_15d_recent = client.get_collateral_score(&asset_id_recent);
+        assert!(
+            score_after_15d_recent > score_after_15d_old,
+            "asset with recent records should score higher than asset with only old records"
+        );
+
+        // Advance another 15 days (total 30 days from initial submissions)
+        // Original records should now have zero contribution
+        env.ledger().with_mut(|li| {
+            li.timestamp = initial_timestamp + 30 * 86_400; // 30 days later
+        });
+
+        let score_at_30d_old = client.get_collateral_score(&asset_id_old);
+        assert_eq!(
+            score_at_30d_old, 0,
+            "records older than MAX_AGE_LEDGERS should contribute zero"
+        );
+
+        // asset_id_recent still has the second record (15 days old) contributing
+        let score_at_30d_recent = client.get_collateral_score(&asset_id_recent);
+        assert!(
+            score_at_30d_recent > score_at_30d_old,
+            "asset with fresher records should score higher"
         );
     }
 }

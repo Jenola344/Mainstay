@@ -4,6 +4,16 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[dependencies]
+asset-registry = { path = "../contracts/asset-registry" }
+engineer-registry = { path = "../contracts/engineer-registry" }
+lifecycle = { path = "../contracts/lifecycle" }
+soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+
 [[test]]
 name = "cross_platform_tests"
 path = "cross_platform_tests.rs"
+
+[[test]]
+name = "test_full_lifecycle_e2e"
+path = "test_full_lifecycle_e2e.rs"
