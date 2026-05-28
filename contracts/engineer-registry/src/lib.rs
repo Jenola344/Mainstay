@@ -184,19 +184,21 @@ impl EngineerRegistry {
     }
 
     /// Verify if an engineer has valid, active credentials.
-    /// Checks both active status and expiration time.
+    /// Checks both active status and expiration time, distinguishing between
+    /// a never-registered engineer and a revoked/expired one.
     ///
     /// # Arguments
     /// * `engineer` - The address of the engineer to verify
     ///
     /// # Returns
-    /// `true` if the engineer has valid, non-expired credentials; `false` otherwise
-    pub fn verify_engineer(env: Env, engineer: Address) -> bool {
+    /// `Some(true)` if the engineer has valid, non-expired credentials;
+    /// `Some(false)` if the engineer exists but is revoked or expired;
+    /// `None` if the engineer was never registered
+    pub fn verify_engineer(env: Env, engineer: Address) -> Option<bool> {
         env.storage()
             .persistent()
             .get::<_, Engineer>(&engineer_key(&engineer))
             .map(|e| e.active && env.ledger().timestamp() < e.expires_at)
-            .unwrap_or(false)
     }
 
     /// Verify multiple engineers in a single call.
@@ -2515,5 +2517,54 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(!results.get(0).unwrap());
         assert!(!results.get(1).unwrap());
+    }
+
+    #[test]
+    fn test_verify_engineer_distinguishes_not_found_from_revoked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        client.initialize_admin(&admin);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let engineer = Address::generate(&env);
+        let never_registered = Address::generate(&env);
+
+        // Never-registered engineer returns None
+        assert_eq!(
+            client.verify_engineer(&never_registered),
+            None,
+            "never-registered engineer should return None"
+        );
+
+        // Register an engineer
+        client.register_engineer(&engineer, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000);
+
+        // Active engineer returns Some(true)
+        assert_eq!(
+            client.verify_engineer(&engineer),
+            Some(true),
+            "active engineer should return Some(true)"
+        );
+
+        // Revoke the engineer
+        client.revoke_credential(&engineer);
+
+        // Revoked engineer returns Some(false)
+        assert_eq!(
+            client.verify_engineer(&engineer),
+            Some(false),
+            "revoked engineer should return Some(false)"
+        );
+
+        // Never-registered still returns None
+        assert_eq!(
+            client.verify_engineer(&never_registered),
+            None,
+            "never-registered engineer should still return None after other operations"
+        );
     }
 }
