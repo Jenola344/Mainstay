@@ -1428,6 +1428,7 @@ impl Lifecycle {
     ///
     /// # Returns
     /// Total number of entries in the engineer's maintenance history.
+    pub fn get_engineer_history_count(env: Env, engineer: Address) -> u32 {
     pub fn get_eng_maint_count(env: Env, engineer: Address) -> u32 {
     pub fn eng_maintenance_history_count(env: Env, engineer: Address) -> u32 {
         let history: Vec<u64> = env
