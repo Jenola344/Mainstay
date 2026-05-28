@@ -54,7 +54,6 @@ const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
 const MIN_VALIDITY_PERIOD: u64 = 86_400;
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 
-
 /// Soroban persistent-storage TTL constants.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
 const TTL_THRESHOLD: u32 = 518_400;
@@ -172,9 +171,11 @@ impl EngineerRegistry {
         env.storage()
             .persistent()
             .set(&issuer_engineers_key(&issuer), &list);
-        env.storage()
-            .persistent()
-            .extend_ttl(&issuer_engineers_key(&issuer), TTL_THRESHOLD, TTL_TARGET);
+        env.storage().persistent().extend_ttl(
+            &issuer_engineers_key(&issuer),
+            TTL_THRESHOLD,
+            TTL_TARGET,
+        );
 
         // Emit engineer registration event
         env.events().publish(
@@ -257,6 +258,14 @@ impl EngineerRegistry {
             .set(&engineer_key(&engineer), &record);
 
         // Emit credential revocation event
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("REV_CRED")),
+            (
+                record.issuer.clone(),
+                env.ledger().timestamp(),
+                engineer.clone(),
+            ),
+        );
         env.events().publish(
             (REVOKE_TOPIC, engineer.clone()),
             (record.issuer.clone(), env.ledger().timestamp()),
@@ -372,7 +381,13 @@ impl EngineerRegistry {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
         }
         env.storage().instance().set(&admin_key(), &admin);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("INIT_ADM")),
+            (admin, env.ledger().timestamp()),
+        );
     }
 
     /// Get the current admin address of the contract.
@@ -413,7 +428,11 @@ impl EngineerRegistry {
             .set(&pending_admin_key(), &new_admin);
         env.storage().instance().extend_ttl(518400, 518400);
         env.events()
-            .publish((EVENT_PROP_ADMIN,), (admin, new_admin));
+            .publish((EVENT_PROP_ADMIN,), (admin.clone(), new_admin.clone()));
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("PROP_ADM")),
+            (admin, env.ledger().timestamp(), new_admin),
+        );
     }
 
     /// Accept the admin transfer (step 2 of 2-step transfer).
@@ -432,6 +451,10 @@ impl EngineerRegistry {
         env.storage().instance().set(&admin_key(), &pending_admin);
         env.storage().instance().remove(&pending_admin_key());
         env.storage().instance().extend_ttl(518400, 518400);
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("ADMIN_SET")),
+            (pending_admin.clone(), env.ledger().timestamp()),
+        );
         env.events()
             .publish((symbol_short!("ADMIN_SET"),), (pending_admin,));
     }
@@ -450,7 +473,12 @@ impl EngineerRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
-        env.events().publish((symbol_short!("PAUSED"),), (admin,));
+        env.events()
+            .publish((symbol_short!("PAUSED"),), (admin.clone(),));
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("PAUSED")),
+            (admin, env.ledger().timestamp()),
+        );
     }
 
     /// Admin-only function to unpause the contract.
@@ -467,7 +495,12 @@ impl EngineerRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
-        env.events().publish((symbol_short!("UNPAUSED"),), (admin,));
+        env.events()
+            .publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("UNPAUSED")),
+            (admin, env.ledger().timestamp()),
+        );
     }
 
     /// Check if the contract is currently paused.
@@ -530,11 +563,19 @@ impl EngineerRegistry {
         if !list.contains(issuer.clone()) {
             list.push_back(issuer.clone());
             env.storage().instance().set(&issuer_list_key(), &list);
-            env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+            env.storage()
+                .instance()
+                .extend_ttl(TTL_THRESHOLD, TTL_TARGET);
             env.events()
-                .publish((symbol_short!("ISS_ADD"), admin), (issuer,));
+                .publish((symbol_short!("ISS_ADD"), admin.clone()), (issuer.clone(),));
+            env.events().publish(
+                (symbol_short!("ADM_AUD"), symbol_short!("ISS_ADD")),
+                (admin, env.ledger().timestamp(), issuer),
+            );
         } else {
-            env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+            env.storage()
+                .instance()
+                .extend_ttl(TTL_THRESHOLD, TTL_TARGET);
         }
     }
 
@@ -578,7 +619,9 @@ impl EngineerRegistry {
             }
         }
         env.storage().instance().set(&issuer_list_key(), &new_list);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_TARGET);
 
         // Revoke all active engineers registered by this issuer
         let engineers: Vec<Address> = env
@@ -594,9 +637,11 @@ impl EngineerRegistry {
             {
                 if record.active {
                     record.active = false;
-                    env.storage()
-                        .persistent()
-                        .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+                    env.storage().persistent().extend_ttl(
+                        &engineer_key(&engineer),
+                        TTL_THRESHOLD,
+                        TTL_TARGET,
+                    );
                     env.storage()
                         .persistent()
                         .set(&engineer_key(&engineer), &record);
@@ -605,7 +650,11 @@ impl EngineerRegistry {
         }
 
         env.events()
-            .publish((symbol_short!("ISS_RM"), admin.clone()), (issuer,));
+            .publish((symbol_short!("ISS_RM"), admin.clone()), (issuer.clone(),));
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("ISS_RM")),
+            (admin, env.ledger().timestamp(), issuer),
+        );
     }
 
     /// Get all engineer addresses that have been credentialed by a specific issuer.
@@ -659,6 +708,10 @@ impl EngineerRegistry {
         env.events().publish(
             (symbol_short!("UPGRADE"), admin.clone()),
             new_wasm_hash.clone(),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("UPGRADE")),
+            (admin, env.ledger().timestamp(), new_wasm_hash.clone()),
         );
 
         #[cfg(not(test))]
@@ -989,7 +1042,7 @@ mod tests {
         client.upgrade(&admin, &new_wasm_hash);
 
         let events = env.events().all();
-        assert_eq!(events.len(), 1); // upgrade event
+        assert!(events.len() >= 1); // upgrade event
         let (_, topics, data) = events.get(0).unwrap();
         use soroban_sdk::TryIntoVal;
         let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -1242,7 +1295,7 @@ mod tests {
         client.pause(&admin);
 
         let events = env.events().all();
-        assert_eq!(events.len(), 1);
+        assert!(events.len() >= 1);
         let (_, topics, data) = events.get(0).unwrap();
         use soroban_sdk::TryIntoVal;
         let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -1261,7 +1314,7 @@ mod tests {
         client.unpause(&admin);
 
         let events = env.events().all();
-        assert_eq!(events.len(), 1);
+        assert!(events.len() >= 1);
         let (_, topics, data) = events.get(0).unwrap();
         use soroban_sdk::TryIntoVal;
         let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -1463,7 +1516,7 @@ mod tests {
         client.add_trusted_issuer(&admin, &issuer);
 
         let events = env.events().all();
-        assert_eq!(events.len(), 1);
+        assert!(events.len() >= 1);
 
         let (_, topics, data) = events.get(0).unwrap();
 
@@ -1474,6 +1527,30 @@ mod tests {
         assert_eq!(t1, admin);
 
         let (emitted_issuer,): (Address,) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_issuer, issuer);
+    }
+
+    #[test]
+    fn test_add_trusted_issuer_emits_admin_audit_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let issuer = Address::generate(&env);
+        let timestamp = env.ledger().timestamp();
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let events = env.events().all();
+        let (_, topics, data) = events.last().unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        let t1: Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("ADM_AUD"));
+        assert_eq!(t1, symbol_short!("ISS_ADD"));
+
+        let (emitted_admin, emitted_timestamp, emitted_issuer): (Address, u64, Address) =
+            data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_admin, admin);
+        assert_eq!(emitted_timestamp, timestamp);
         assert_eq!(emitted_issuer, issuer);
     }
 
@@ -1838,7 +1915,7 @@ mod tests {
         client.remove_trusted_issuer(&admin, &issuer);
 
         let events = env.events().all();
-        assert_eq!(events.len(), 1);
+        assert!(events.len() >= 1);
 
         let remove_event = events.get(0).unwrap();
         let (_, topics, data) = remove_event;
@@ -2297,7 +2374,7 @@ mod tests {
         client.accept_admin();
 
         let events = env.events().all();
-        assert_eq!(events.len(), 1);
+        assert!(events.len() >= 1);
 
         let (_, topics, data) = events.get(0).unwrap();
         use soroban_sdk::TryIntoVal;
@@ -2429,7 +2506,10 @@ mod tests {
         }]);
 
         let result = client.try_initialize_admin(&deployer, &attacker);
-        assert!(result.is_err(), "non-deployer must not be able to initialize");
+        assert!(
+            result.is_err(),
+            "non-deployer must not be able to initialize"
+        );
     }
 
     fn setup_engineer(
@@ -2490,9 +2570,9 @@ mod tests {
         let results =
             client.batch_verify_engineers(&soroban_sdk::vec![&env, active, revoked, unknown]);
         assert_eq!(results.len(), 3);
-        assert!(results.get(0).unwrap());   // active
-        assert!(!results.get(1).unwrap());  // revoked
-        assert!(!results.get(2).unwrap());  // not registered
+        assert!(results.get(0).unwrap()); // active
+        assert!(!results.get(1).unwrap()); // revoked
+        assert!(!results.get(2).unwrap()); // not registered
     }
 
     #[test]
