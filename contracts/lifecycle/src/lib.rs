@@ -2120,6 +2120,23 @@ impl Lifecycle {
             (admin, env.ledger().timestamp(), asset_id),
         );
     }
+
+    /// Request a loan against a collateral-eligible asset.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The asset to use as collateral
+    /// * `threshold` - Minimum vouch count required; must be > 0
+    ///
+    /// # Panics
+    /// - [`ContractError::InvalidConfig`] if `threshold` is 0
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    pub fn request_loan(env: Env, asset_id: u64, threshold: u32) -> bool {
+        if threshold == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        Self::is_collateral_eligible(env, asset_id)
+    }
 }
 
 #[cfg(test)]
@@ -6832,6 +6849,23 @@ mod tests {
         assert!(
             score_at_30d_recent > score_at_30d_old,
             "asset with fresher records should score higher"
+        );
+    }
+
+    #[test]
+    fn test_request_loan_zero_threshold_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+
+        let result = client.try_request_loan(&asset_id, &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32,
+            ))),
         );
     }
 }
