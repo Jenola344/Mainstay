@@ -2124,15 +2124,19 @@ impl Lifecycle {
     /// Request a loan against a collateral-eligible asset.
     ///
     /// # Arguments
-    /// * `asset_id` - The asset to use as collateral
+    /// * `asset_id`  - The asset to use as collateral
     /// * `threshold` - Minimum vouch count required; must be > 0
+    /// * `amount`    - Loan amount in stroops; must be > 0
     ///
     /// # Panics
-    /// - [`ContractError::InvalidConfig`] if `threshold` is 0
+    /// - [`ContractError::InvalidConfig`] if `threshold` or `amount` is 0
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
-    pub fn request_loan(env: Env, asset_id: u64, threshold: u32) -> bool {
+    pub fn request_loan(env: Env, asset_id: u64, threshold: u32, amount: i128) -> bool {
         if threshold == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        if amount == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
         Self::is_collateral_eligible(env, asset_id)
@@ -6860,7 +6864,24 @@ mod tests {
         let (client, asset_registry_client, _, _) = setup(&env, 0);
         let asset_id = register_asset(&env, &asset_registry_client);
 
-        let result = client.try_request_loan(&asset_id, &0);
+        let result = client.try_request_loan(&asset_id, &0_u32, &1_i128);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_request_loan_zero_amount_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+
+        let result = client.try_request_loan(&asset_id, &1_u32, &0_i128);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
