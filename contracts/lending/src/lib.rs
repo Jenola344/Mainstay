@@ -382,4 +382,111 @@ impl LendingContract {
             .get(&SLASH_BAL)
             .unwrap_or(0u64)
     }
+
+    /// Returns whether the contract has been initialized.
+    pub fn is_initialized(env: Env) -> bool {
+        env.storage().persistent().has(&ADMIN_KEY)
+    }
+
+    /// Returns the current admin address.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .persistent()
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
+    }
+
+    /// Returns the token contract address.
+    pub fn get_token(env: Env) -> Address {
+        env.storage()
+            .persistent()
+            .get(&TOKEN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn test_is_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        assert!(!client.is_initialized());
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&deployer, &admin, &token);
+        assert!(client.is_initialized());
+    }
+
+    #[test]
+    fn test_get_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&deployer, &admin, &token);
+
+        let retrieved_admin = client.get_admin();
+        assert_eq!(retrieved_admin, admin);
+    }
+
+    #[test]
+    fn test_get_token() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&deployer, &admin, &token);
+
+        let retrieved_token = client.get_token();
+        assert_eq!(retrieved_token, token);
+    }
+
+    #[test]
+    fn test_slash_treasury() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.initialize(&deployer, &admin, &token);
+
+        // Verify initial slash balance is zero
+        let initial_balance = client.get_slash_balance();
+        assert_eq!(initial_balance, 0);
+
+        // slash_treasury should work without error when balance is zero
+        client.slash_treasury(&admin);
+
+        // Verify balance remains zero
+        let final_balance = client.get_slash_balance();
+        assert_eq!(final_balance, 0);
+    }
 }
