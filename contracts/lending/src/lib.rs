@@ -27,6 +27,8 @@ pub enum ContractError {
     InsufficientFunds = 8,
     /// Stake is below the minimum required for non-zero yield (50 stroops).
     StakeBelowMinimum = 9,
+    /// Voucher cannot withdraw because an active loan exists.
+    VouchWithdrawNotAllowed = 10,
 }
 
 #[contracttype]
@@ -234,6 +236,11 @@ impl LendingContract {
     ///   this borrower
     pub fn vouch(env: Env, borrower: Address, voucher: Address, stake: u64) {
         voucher.require_auth();
+
+        // #629: Prevent borrower from vouching for themselves
+        if voucher == borrower {
+            panic_with_error!(&env, ContractError::DuplicateVouch);
+        }
 
         if stake == 0 {
             panic_with_error!(&env, ContractError::ZeroStake);
