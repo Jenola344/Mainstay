@@ -42,6 +42,7 @@ pub enum LoanStatus {
     Active = 0,
     Repaid = 1,
     Defaulted = 2,
+    None = 3,
 }
 
 #[contracttype]
