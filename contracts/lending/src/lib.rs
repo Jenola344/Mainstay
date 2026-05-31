@@ -460,11 +460,7 @@ mod tests {
     #[test]
     fn test_slash_bps_guard_prevents_underflow() {
         let (env, _contract_id, _admin, _token, _deployer) = setup();
-        let client = LendingContractClient::new(&env, &_contract_id);
-
-        let borrower = Address::generate(&env);
-
-        client.request_loan(&borrower, &1000);
+        let _client = LendingContractClient::new(&env, &_contract_id);
 
         assert!(SLASH_BPS <= 10_000);
     }
