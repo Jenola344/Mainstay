@@ -242,6 +242,16 @@ pub struct AssetRegistry;
 
 #[contractimpl]
 impl AssetRegistry {
+    /// Propose a timelocked deregistration for an asset.
+    /// This is the first step in removing an asset from the registry.
+    ///
+    /// # Arguments
+    /// * `caller` - The address initiating the proposal (owner or admin)
+    /// * `asset_id` - The unique identifier of the asset to deregister
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::UnauthorizedOwner`] if the caller is not the asset owner or admin
     pub fn propose_deregister_asset(env: Env, caller: Address, asset_id: u64) {
         ensure_not_paused(&env);
         let asset: Asset = env
@@ -270,6 +280,16 @@ impl AssetRegistry {
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
     }
 
+    /// Execute a previously proposed asset deregistration after the timelock expires.
+    ///
+    /// # Arguments
+    /// * `caller` - The address completing the deregistration
+    /// * `asset_id` - The unique identifier of the asset to deregister
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::UnauthorizedOwner`] if the caller is not the asset owner or admin
+    /// - [`ContractError::TimelockNotReady`] if the proposal timelock has not yet matured
     pub fn execute_deregister_asset(env: Env, caller: Address, asset_id: u64) {
         require_timelock_ready(&env, DEREG_TOPIC, asset_id);
         Self::deregister_asset(env, caller, asset_id);

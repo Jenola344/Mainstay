@@ -40,6 +40,26 @@ Scores are calculated based on:
 2. **Time-Based Decay**: Scores decrease over time without maintenance
 3. **Score Cap**: Total score never exceeds 100 points
 
+### Score Formula
+
+The Lifecycle contract computes collateral score using a combination of weighted maintenance events and time decay:
+
+```text
+raw_score = sum(weight(task_i) * recency_weight(task_i))
+decay = floor((current_timestamp - last_update) / decay_interval) * decay_rate
+score = clamp(max(raw_score - decay, 0), 0, 100)
+return if has_history && score == 0 { 1 } else { score }
+```
+
+### Score Diagram
+
+```
+Maintenance history  -->  Weighted event points  -->  Time decay  -->  Score cap (100)
+      task weights          recency calc             decay rate         clamp to [0,100]
+```
+
+The eligibility threshold is checked after this score is computed: the asset is collateral-eligible only if the final score is greater than or equal to the configured threshold.
+
 ## Task Type Weights
 
 Maintenance tasks are categorized into three tiers with different point values:

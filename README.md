@@ -185,6 +185,21 @@ Run tests:
 cargo test
 ```
 
+## ⚠️ Known Limitations
+
+Mainstay v1 is a strong foundation, but there are several current limitations contributors should be aware of:
+
+- **No native asset transfer support**: Asset ownership metadata is stored in the asset registry, but the lifecycle contract does not yet provide a complete on-chain transfer reconciliation flow. See issue [#600](https://github.com/TwinTrustMainstay/Mainstay/issues/600).
+- **Partial maintenance history handling**: If history is pruned or partially removed, the system currently lacks a robust partial-history recovery path. See issue [#601](https://github.com/TwinTrustMainstay/Mainstay/issues/601).
+- **Hardcoded score weights**: Task type weights are currently defined in contract logic rather than a fully configurable on-chain profile. See issue [#602](https://github.com/TwinTrustMainstay/Mainstay/issues/602).
+- **Unbounded history growth when max_history is high**: A large `max_history` can still lead to expensive history storage and query operations. See issue [#603](https://github.com/TwinTrustMainstay/Mainstay/issues/603).
+
+### Planned resolution timeline
+
+- **v1.1**: Add asset transfer reconciliation and improved history pruning
+- **v1.2**: Make task weights configurable and support partial history reconstruction
+- **v2.0**: Upgrade asset ownership and history indexing for large portfolios
+
 ## ⏱️ TTL (Time-To-Live) Strategy
 
 Soroban persistent storage entries have a limited Time-To-Live (TTL) and will expire if not extended. To prevent silent data loss, all three contracts automatically extend the TTL of persistent storage entries after every write operation.

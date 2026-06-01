@@ -134,6 +134,14 @@ pub struct EngineerRegistry;
 
 #[contractimpl]
 impl EngineerRegistry {
+    /// Propose the revocation of an engineer's credential.
+    /// The revocation is subject to a timelock before it can be executed.
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer whose credential is being revoked
+    ///
+    /// # Panics
+    /// - [`ContractError::EngineerNotFound`] if the engineer record does not exist
     pub fn propose_revoke_credential(env: Env, engineer: Address) {
         ensure_not_paused(&env);
         let record: Engineer = env
@@ -155,6 +163,14 @@ impl EngineerRegistry {
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
     }
 
+    /// Execute a pending engineer credential revocation after its timelock has expired.
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer whose credential revocation is being executed
+    ///
+    /// # Panics
+    /// - [`ContractError::EngineerNotFound`] if the engineer record does not exist
+    /// - [`ContractError::TimelockNotReady`] if the revocation timelock is not yet ready
     pub fn execute_revoke_credential(env: Env, engineer: Address) {
         require_revoke_timelock_ready(&env, &engineer);
         Self::revoke_credential(env, engineer);
