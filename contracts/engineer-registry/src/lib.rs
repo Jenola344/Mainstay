@@ -890,6 +890,27 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_engineer_false_after_revoke() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[9u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+
+        // Sanity: engineer is initially verified
+        assert!(client.verify_engineer(&engineer));
+
+        // Revoke credentials and verify immediately returns false
+        client.revoke_credential(&engineer);
+        assert!(!client.verify_engineer(&engineer));
+    }
+
+    #[test]
     fn test_register_engineer_emits_event() {
         let env = Env::default();
         env.mock_all_auths();
