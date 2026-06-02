@@ -56,6 +56,10 @@ pub struct AssetInput {
 pub struct TimelockProposal {
     pub proposed_at: u64,
     pub executed: bool,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum AssetStatus {
     Active = 0,
     Decommissioned = 1,
@@ -3571,7 +3575,6 @@ mod tests {
 
         let lifecycle_admin = Address::generate(&env);
         let engineer_registry_id = Address::generate(&env);
-        lifecycle_client.initialize(
         let deployer = Address::generate(&env);
         lifecycle_client.initialize(
             &deployer,

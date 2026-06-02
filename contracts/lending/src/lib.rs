@@ -912,7 +912,6 @@ mod tests {
         assert!(loan.is_some());
         assert_eq!(loan.unwrap().status, LoanStatus::Repaid);
     }
-}
 
     #[test]
     fn test_request_loan_emits_event() {
