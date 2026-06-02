@@ -609,29 +609,44 @@ impl AssetRegistry {
     ///
     /// # Arguments
     /// * `owner` - The address of the asset owner
-    /// * `offset` - Starting index for pagination
-    /// * `limit` - Maximum number of asset IDs to return
+    /// * `page` - Zero-based page index
+    /// * `page_size` - Number of asset IDs to return per page
     ///
     /// # Returns
     /// Vec containing the requested page of asset IDs
-    pub fn get_assets_by_owner_page(env: Env, owner: Address, offset: u32, limit: u32) -> Vec<u64> {
+    pub fn get_assets_by_owner_page(env: Env, owner: Address, page: u32, page_size: u32) -> Vec<u64> {
+        let key = owner_index_key(&owner);
         let all_assets: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&owner_index_key(&owner))
+            .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
 
-        let len = all_assets.len();
-        if offset >= len || limit == 0 {
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        }
+
+        if page_size == 0 {
             return Vec::new(&env);
         }
 
-        let end = (offset + limit).min(len);
-        let mut page = Vec::new(&env);
-        for i in offset..end {
-            page.push_back(all_assets.get(i).unwrap());
+        let len = all_assets.len();
+        let offset = match page.checked_mul(page_size) {
+            Some(offset) => offset,
+            None => return Vec::new(&env),
+        };
+        if offset >= len {
+            return Vec::new(&env);
         }
-        page
+
+        let end = offset.checked_add(page_size).unwrap_or(len).min(len);
+        let mut page_assets = Vec::new(&env);
+        for i in offset..end {
+            page_assets.push_back(all_assets.get(i).unwrap());
+        }
+        page_assets
     }
 
     /// Get the total count of registered assets in the system.
@@ -2079,6 +2094,84 @@ mod tests {
         let stranger = Address::generate(&env);
         let ids = client.get_assets_by_owner(&stranger);
         assert_eq!(ids.len(), 0);
+    }
+
+    #[test]
+    fn test_get_assets_by_owner_page_returns_paged_ids() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let mut ids: Vec<u64> = Vec::new(&env);
+        ids.push_back(client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Asset 0"),
+            &unique_serial(&env),
+            &owner,
+        ));
+        ids.push_back(client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Asset 1"),
+            &unique_serial(&env),
+            &owner,
+        ));
+        ids.push_back(client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Asset 2"),
+            &unique_serial(&env),
+            &owner,
+        ));
+        ids.push_back(client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Asset 3"),
+            &unique_serial(&env),
+            &owner,
+        ));
+        ids.push_back(client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Asset 4"),
+            &unique_serial(&env),
+            &owner,
+        ));
+
+        let page0 = client.get_assets_by_owner_page(&owner, &0, &2);
+        assert_eq!(page0.len(), 2);
+        assert_eq!(page0.get(0).unwrap(), ids.get(0).unwrap());
+        assert_eq!(page0.get(1).unwrap(), ids.get(1).unwrap());
+
+        let page1 = client.get_assets_by_owner_page(&owner, &1, &2);
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1.get(0).unwrap(), ids.get(2).unwrap());
+        assert_eq!(page1.get(1).unwrap(), ids.get(3).unwrap());
+
+        let page2 = client.get_assets_by_owner_page(&owner, &2, &2);
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2.get(0).unwrap(), ids.get(4).unwrap());
+
+        let page3 = client.get_assets_by_owner_page(&owner, &3, &2);
+        assert_eq!(page3.len(), 0);
+    }
+
+    #[test]
+    fn test_get_assets_by_owner_page_returns_empty_for_unknown_owner_or_zero_page_size() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let unknown_owner = Address::generate(&env);
+        client.register_asset(&symbol_short!("GENSET"), &String::from_str(&env, "Asset X"), &unique_serial(&env), &owner);
+
+        assert_eq!(client.get_assets_by_owner_page(&unknown_owner, &0, &2).len(), 0);
+        assert_eq!(client.get_assets_by_owner_page(&owner, &0, &0).len(), 0);
+        assert_eq!(client.get_assets_by_owner_page(&owner, &5, &2).len(), 0);
     }
 
     #[test]
