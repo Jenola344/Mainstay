@@ -48,6 +48,7 @@ pub struct TimelockProposal {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub enum DataKey {
     AssetRegistry,
     EngineerRegistry,

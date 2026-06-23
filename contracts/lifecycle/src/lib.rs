@@ -9,9 +9,7 @@ use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_
 use crate::types::{
     BatchRecord, Config, DataKey, MaintenanceRecord, ScoreEntry, TimelockProposal,
 };
-use shared::validation::{
-    require_non_empty_vec, require_positive_u32, require_positive_u64, require_string_length,
-};
+use shared::validation::require_non_empty_vec;
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, Address, BytesN, Env, String, Symbol,
     Vec,
@@ -231,7 +229,7 @@ fn require_timelock_ready(env: &Env, op: Symbol) {
 
 fn validate_notes_length(env: &Env, notes: &soroban_sdk::String, max: u32) {
     if notes.is_empty() {
-        panic_with_error!(env, ContractError::InvalidConfig);
+        panic_with_error!(env, ContractError::NotesTooLong);
     }
     if notes.len() > max {
         panic_with_error!(env, ContractError::NotesTooLong);
@@ -613,7 +611,6 @@ impl Lifecycle {
         if score_increment == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
-        require_positive_u32(score_increment, "score_increment");
 
         let mut config: Config = env
             .storage()
@@ -664,8 +661,6 @@ impl Lifecycle {
         if decay_rate == 0 || decay_interval == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
-        require_positive_u32(decay_rate, "decay_rate");
-        require_positive_u64(decay_interval, "decay_interval");
 
         let mut config: Config = env
             .storage()
@@ -731,7 +726,6 @@ impl Lifecycle {
         if threshold == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
-        require_positive_u32(threshold, "threshold");
 
         let old_threshold = config.eligibility_threshold;
         config.eligibility_threshold = threshold;
@@ -776,7 +770,6 @@ impl Lifecycle {
         if new_max == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
-        require_positive_u32(new_max, "max_history");
 
         let mut config: Config = env
             .storage()
@@ -823,7 +816,6 @@ impl Lifecycle {
         if new_max == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
-        require_positive_u32(new_max, "max_notes_length");
 
         let mut config: Config = env
             .storage()
@@ -907,29 +899,12 @@ impl Lifecycle {
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
 
-        // Cross-check engineer credential and check for grace period
+        // Cross-check engineer credential via registry
         let registry_id = get_engineer_registry_addr(&env);
         let registry = engineer_registry::EngineerRegistryClient::new(&env, &registry_id);
-        let cred_status = registry.get_credential_status(&engineer);
-        
-        match cred_status {
-            engineer_registry::CredentialStatus::Valid => {},
-            engineer_registry::CredentialStatus::GracePeriod => {
-                // Allow submission but emit warning event
-                env.events().publish(
-                    (symbol_short!("GRACE_WARN"), engineer.clone()),
-                    (asset_id, timestamp),
-                );
-            },
-            engineer_registry::CredentialStatus::HardExpired => {
-                panic_with_error!(&env, ContractError::UnauthorizedEngineer)
-            },
-            engineer_registry::CredentialStatus::Revoked => {
-                panic_with_error!(&env, ContractError::UnauthorizedEngineer)
-            },
-            engineer_registry::CredentialStatus::NotFound => {
-                panic_with_error!(&env, engineer_registry::ContractError::EngineerNotFound)
-            },
+        let verified = registry.verify_engineer(&engineer);
+        if !verified {
+            panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
         require_engineer_authorized(&env, asset_id, &engineer);
 
@@ -1109,34 +1084,17 @@ impl Lifecycle {
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
 
-        // Validate engineer credential and check for grace period
+        // Validate engineer credential via registry
         let engineer_registry = get_engineer_registry_addr(&env);
         let engineer_registry_client =
             engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry);
-        let cred_status = engineer_registry_client.get_credential_status(&engineer);
-        
-        let timestamp = env.ledger().timestamp();
-        match cred_status {
-            engineer_registry::CredentialStatus::Valid => {},
-            engineer_registry::CredentialStatus::GracePeriod => {
-                // Allow submission but emit warning event
-                env.events().publish(
-                    (symbol_short!("GRACE_WARN"), engineer.clone()),
-                    (asset_id, timestamp),
-                );
-            },
-            engineer_registry::CredentialStatus::HardExpired => {
-                panic_with_error!(&env, ContractError::UnauthorizedEngineer)
-            },
-            engineer_registry::CredentialStatus::Revoked => {
-                panic_with_error!(&env, ContractError::UnauthorizedEngineer)
-            },
-            engineer_registry::CredentialStatus::NotFound => {
-                panic_with_error!(&env, engineer_registry::ContractError::EngineerNotFound)
-            },
+        let verified = engineer_registry_client.verify_engineer(&engineer);
+        if !verified {
+            panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
         require_engineer_authorized(&env, asset_id, &engineer);
 
+        let timestamp = env.ledger().timestamp();
         let mut history: Vec<MaintenanceRecord> = env
             .storage()
             .persistent()
@@ -3412,7 +3370,6 @@ mod tests {
         let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
         let result =
             lifecycle.try_initialize(&admin, &same_registry_id, &same_registry_id, &admin, &0u32);
-        let result = lifecycle.try_initialize(&admin, &same_registry_id, &same_registry_id, &admin, &0u32);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -6362,10 +6319,6 @@ mod tests {
         let xfer_event = events
             .iter()
             .find(|(_, topics, _)| {
-                use soroban_sdk::FromVal;
-                topics.get(0).map_or(false, |v| {
-                    Symbol::from_val(&env, &v) == symbol_short!("XFER")
-                })
                 topics
                     .get(0)
                     .and_then(|v| v.try_into_val(&env).ok())
