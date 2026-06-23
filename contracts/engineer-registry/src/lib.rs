@@ -2814,6 +2814,9 @@ mod tests {
         let hash3 = BytesN::from_array(&env, &[3u8; 32]);
         client.register_engineer(&engineer3, &hash3, &issuer, &31_536_000);
         assert_eq!(client.get_engineer_count(), 3);
+    }
+
+    #[test]
     fn test_verify_engineer_distinguishes_not_found_from_revoked() {
         let env = Env::default();
         env.mock_all_auths();

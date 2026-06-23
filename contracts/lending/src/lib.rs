@@ -792,7 +792,6 @@ mod tests {
 
         assert!(SLASH_BPS <= 10_000);
     }
-}
 
 
     fn setup_contract(env: &Env) -> (Address, Address, Address) {

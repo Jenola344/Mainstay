@@ -25,7 +25,7 @@ pub enum ContractError {
     SameOwner = 12,
     TimelockNotExpired = 13,
     ProposalNotFound = 14,
-    AssetDecommissioned = 13,
+    AssetDecommissioned = 15,
 }
 
 #[contracttype]

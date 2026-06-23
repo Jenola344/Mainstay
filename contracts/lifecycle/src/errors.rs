@@ -21,10 +21,10 @@ pub enum ContractError {
     SameRegistryAddress = 13,
     IndexOutOfBounds = 14,
     UnauthorizedOwner = 15,
-    TimelockNotExpired = 16,
-    ProposalNotFound = 17,
     EngineerNotAuthorized = 16,
-    ScoreOverflow = 16,
+    TimelockNotExpired = 17,
+    ProposalNotFound = 18,
+    ScoreOverflow = 19,
     /// Notes field exceeds the configured maximum length.
-    NotesTooLong = 18,
+    NotesTooLong = 20,
 }
