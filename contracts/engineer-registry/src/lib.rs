@@ -292,22 +292,35 @@ impl EngineerRegistry {
         );
     }
 
-    /// Verify if an engineer has valid, active credentials.
-    /// Checks both active status and expiration time, distinguishing between
-    /// a never-registered engineer and a revoked/expired one.
+    /// Verify if an engineer has valid, active credentials with detailed status.
+    /// Distinguishes between valid, expired, revoked, and never-registered engineers.
     ///
     /// # Arguments
     /// * `engineer` - The address of the engineer to verify
     ///
     /// # Returns
-    /// `Some(true)` if the engineer has valid, non-expired credentials;
-    /// `Some(false)` if the engineer exists but is revoked or expired;
-    /// `None` if the engineer was never registered
-    pub fn verify_engineer(env: Env, engineer: Address) -> Option<bool> {
-        env.storage()
+    /// A CredentialStatus enum:
+    /// - `CredentialStatus::Valid` if the engineer has active, non-expired credentials
+    /// - `CredentialStatus::Expired` if the engineer exists but credentials are expired
+    /// - `CredentialStatus::Revoked` if the engineer exists but credentials are revoked
+    /// - `CredentialStatus::NotFound` if the engineer was never registered
+    pub fn verify_engineer(env: Env, engineer: Address) -> CredentialStatus {
+        match env
+            .storage()
             .persistent()
             .get::<_, Engineer>(&engineer_key(&engineer))
-            .map(|e| e.active && env.ledger().timestamp() < e.expires_at)
+        {
+            Some(e) => {
+                if !e.active {
+                    CredentialStatus::Revoked
+                } else if env.ledger().timestamp() < e.expires_at {
+                    CredentialStatus::Valid
+                } else {
+                    CredentialStatus::Expired
+                }
+            }
+            None => CredentialStatus::NotFound,
+        }
     }
 
     /// Verify multiple engineers in a single call.
@@ -317,19 +330,29 @@ impl EngineerRegistry {
     /// * `engineers` - Vec of engineer addresses to verify
     ///
     /// # Returns
-    /// `Vec<bool>` where each element is `true` if the corresponding engineer
-    /// has valid, non-expired credentials; `false` otherwise
-    pub fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<bool> {
+    /// `Vec<CredentialStatus>` where each element indicates the credential status
+    /// of the corresponding engineer (Valid, Expired, Revoked, or NotFound)
+    pub fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<CredentialStatus> {
         let now = env.ledger().timestamp();
-        let mut results: Vec<bool> = Vec::new(&env);
+        let mut results: Vec<CredentialStatus> = Vec::new(&env);
         for engineer in engineers.iter() {
-            let valid = env
+            let status = match env
                 .storage()
                 .persistent()
                 .get::<_, Engineer>(&engineer_key(&engineer))
-                .map(|e| e.active && now < e.expires_at)
-                .unwrap_or(false);
-            results.push_back(valid);
+            {
+                Some(e) => {
+                    if !e.active {
+                        CredentialStatus::Revoked
+                    } else if now < e.expires_at {
+                        CredentialStatus::Valid
+                    } else {
+                        CredentialStatus::Expired
+                    }
+                }
+                None => CredentialStatus::NotFound,
+            };
+            results.push_back(status);
         }
         results
     }
