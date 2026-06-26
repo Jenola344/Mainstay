@@ -11,6 +11,23 @@ pub fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_histo
         .persistent()
         .get(&key)
         .unwrap_or_else(|| Vec::new(env));
+
+    // Deduplicate: if the last entry shares the same ledger timestamp, update it in-place
+    // instead of appending. This prevents multiple submissions in the same ledger from
+    // inflating history length and skewing trend analysis.
+    let last_idx = history.len().saturating_sub(1);
+    if !history.is_empty() {
+        let last = history.get(last_idx).unwrap();
+        if last.timestamp == entry.timestamp {
+            history.set(last_idx, entry);
+            env.storage().persistent().set(&key, &history);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+            return;
+        }
+    }
+
     if max_history > 0 && history.len() >= max_history {
         history.remove(0);
     }
