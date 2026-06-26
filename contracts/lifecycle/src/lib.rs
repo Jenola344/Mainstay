@@ -1316,22 +1316,26 @@ impl Lifecycle {
     /// * `asset_ids` - A list of asset IDs to query
     ///
     /// # Returns
-    /// A Vec containing the current collateral score for each requested asset
+    /// A Vec of `(asset_id, score)` pairs with lazy decay applied. Unknown asset
+    /// IDs are skipped (omitted from results) rather than causing a panic.
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if the contract is not initialized
-    /// - [`ContractError::AssetNotFound`] if any asset does not exist
-    pub fn get_collateral_score_batch(env: Env, asset_ids: Vec<u64>) -> Vec<u32> {
-        // Ensure CONFIG is present (NotInitialized guard)
-        env.storage()
+    pub fn get_collateral_score_batch(env: Env, asset_ids: Vec<u64>) -> Vec<(u64, u32)> {
+        let config: Config = env
+            .storage()
             .persistent()
             .get::<_, Config>(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
         let asset_registry = get_asset_registry_addr(&env);
-        let mut results: Vec<u32> = Vec::new(&env);
+        let client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let mut results: Vec<(u64, u32)> = Vec::new(&env);
         for asset_id in asset_ids.iter() {
-            verify_asset_exists(&env, &asset_registry, &asset_id);
-            results.push_back(compute_decay(&env, asset_id));
+            if client.try_get_asset(&asset_id).is_err() {
+                continue;
+            }
+            let score = apply_decay(&env, asset_id, false, false, config.max_history);
+            results.push_back((asset_id, score));
         }
         results
     }
@@ -3712,10 +3716,9 @@ mod tests {
         ids.push_back(asset_id);
         let results = client.get_collateral_score_batch(&ids);
         assert_eq!(results.len(), 1);
-        assert_eq!(
-            results.get(0).unwrap(),
-            client.get_collateral_score(&asset_id)
-        );
+        let (ret_id, ret_score) = results.get(0).unwrap();
+        assert_eq!(ret_id, asset_id);
+        assert_eq!(ret_score, client.get_collateral_score(&asset_id));
     }
 
     #[test]
@@ -3749,32 +3752,39 @@ mod tests {
         ids.push_back(asset_b);
         let results = client.get_collateral_score_batch(&ids);
         assert_eq!(results.len(), 2);
-        assert_eq!(
-            results.get(0).unwrap(),
-            client.get_collateral_score(&asset_a)
-        );
-        assert_eq!(
-            results.get(1).unwrap(),
-            client.get_collateral_score(&asset_b)
-        );
+        let (id_a, score_a) = results.get(0).unwrap();
+        assert_eq!(id_a, asset_a);
+        assert_eq!(score_a, client.get_collateral_score(&asset_a));
+        let (id_b, score_b) = results.get(1).unwrap();
+        assert_eq!(id_b, asset_b);
+        assert_eq!(score_b, client.get_collateral_score(&asset_b));
     }
 
     #[test]
-    fn test_get_collateral_score_batch_unknown_asset_returns_error() {
+    fn test_get_collateral_score_batch_unknown_asset_is_skipped() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (client, _, _, _) = setup(&env, 0);
-        let mut ids = Vec::new(&env);
-        ids.push_back(999u64);
-
-        let result = client.try_get_collateral_score_batch(&ids);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::AssetNotFound as u32,
-            ))),
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        let known_id = register_asset(&env, &asset_registry_client);
+        client.submit_maintenance(
+            &known_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, ""),
+            &engineer,
         );
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(known_id);
+        ids.push_back(999u64); // unknown
+
+        // Unknown asset is silently skipped; only the known asset appears in results.
+        let results = client.get_collateral_score_batch(&ids);
+        assert_eq!(results.len(), 1);
+        let (ret_id, ret_score) = results.get(0).unwrap();
+        assert_eq!(ret_id, known_id);
+        assert_eq!(ret_score, client.get_collateral_score(&known_id));
     }
 
     // --- Upgrade tests ---
