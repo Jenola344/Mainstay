@@ -69,6 +69,12 @@ pub struct Vouch {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Borrower {
+    pub default_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub yield_bps: u64,
     pub slash_bps: u64,
@@ -241,6 +247,7 @@ impl LendingContract {
             panic_with_error!(&env, ContractError::InsufficientFunds);
         }
 
+        let deadline = env.ledger().timestamp() + get_loan_duration(&env);
         let loan = Loan {
             borrower: borrower.clone(),
             amount,

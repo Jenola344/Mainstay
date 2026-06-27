@@ -27,4 +27,6 @@ pub enum ContractError {
     ScoreOverflow = 19,
     /// Notes field exceeds the configured maximum length.
     NotesTooLong = 20,
+    /// Asset score is frozen due to decommission; decay and mutation are blocked.
+    ScoreFrozen = 21,
 }

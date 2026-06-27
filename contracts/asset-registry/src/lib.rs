@@ -26,6 +26,10 @@ pub enum ContractError {
     TimelockNotExpired = 13,
     ProposalNotFound = 14,
     AssetDecommissioned = 15,
+    /// A pending (non-executed) deregister proposal already exists for this asset.
+    /// A new proposal cannot overwrite it; wait for the timelock to expire and execute,
+    /// or allow the existing proposal to lapse before re-proposing.
+    ProposalAlreadyExists = 16,
 }
 
 #[contracttype]
@@ -298,6 +302,12 @@ impl AssetRegistry {
     /// Propose a timelocked deregistration for an asset.
     /// This is the first step in removing an asset from the registry.
     ///
+    /// Timelock semantics: after proposing, the caller must wait
+    /// `TIMELOCK_DELAY_SECS` (48 hours) before calling
+    /// [`execute_deregister_asset`]. A proposal cannot be re-proposed while
+    /// a pending (non-executed) proposal already exists for the same asset —
+    /// doing so would reset the clock and allow indefinite delay.
+    ///
     /// # Arguments
     /// * `caller` - The address initiating the proposal (owner or admin)
     /// * `asset_id` - The unique identifier of the asset to deregister
@@ -305,6 +315,7 @@ impl AssetRegistry {
     /// # Panics
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
     /// - [`ContractError::UnauthorizedOwner`] if the caller is not the asset owner or admin
+    /// - [`ContractError::ProposalAlreadyExists`] if a pending proposal already exists
     pub fn propose_deregister_asset(env: Env, caller: Address, asset_id: u64) {
         ensure_not_paused(&env);
         let asset: Asset = env
@@ -321,6 +332,17 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::UnauthorizedOwner);
         }
         let key = timelock_key(DEREG_TOPIC, asset_id);
+        // Block re-proposal if a pending proposal already exists to prevent
+        // the owner from resetting the timelock clock indefinitely.
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<_, TimelockProposal>(&key)
+        {
+            if !existing.executed {
+                panic_with_error!(&env, ContractError::ProposalAlreadyExists);
+            }
+        }
         env.storage().persistent().set(
             &key,
             &TimelockProposal {
@@ -1393,6 +1415,63 @@ impl AssetRegistry {
         );
         score
     }
+
+    /// Decommission an asset and notify the lifecycle contract to freeze the score.
+    ///
+    /// This combines the registry-side decommission flag with a cross-contract call
+    /// to the lifecycle contract so the collateral score is captured at decommission
+    /// time and no longer decays. Lenders will see the final verified state.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored admin
+    /// * `asset_id` - The unique identifier of the asset to decommission
+    /// * `lifecycle_contract` - Address of the lifecycle contract to notify
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn decommission_asset_notify(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        lifecycle_contract: Address,
+    ) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        if !Self::asset_exists(env.clone(), asset_id) {
+            panic_with_error!(&env, ContractError::AssetNotFound);
+        }
+
+        let decomm_key = decommissioned_key(asset_id);
+        env.storage().persistent().set(&decomm_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&decomm_key, TTL_THRESHOLD, TTL_TARGET);
+
+        let maint_key = (symbol_short!("U_MAINT"), asset_id);
+        env.storage().persistent().remove(&maint_key);
+
+        let ledger_seq = env.ledger().sequence();
+        env.events()
+            .publish((symbol_short!("DECOMM"), asset_id), ledger_seq);
+
+        // Notify lifecycle to freeze the collateral score at its current value.
+        let args = soroban_sdk::vec![
+            &env,
+            soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&asset_id, &env)
+        ];
+        env.invoke_contract::<()>(
+            &lifecycle_contract,
+            &Symbol::new(&env, "decommission_notify"),
+            args,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1403,7 +1482,7 @@ mod tests {
     use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Events, Ledger as _, Logs},
-        Bytes, Env, FromVal, String, Symbol,
+        Bytes, Env, FromVal, String, Symbol, TryIntoVal,
     };
 
     use crate::AssetRegistryClient;
@@ -1411,20 +1490,35 @@ mod tests {
     use lifecycle;
 
     fn unique_serial(env: &Env) -> String {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use core::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(1);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        String::from_str(env, &std::format!("SN-{n}"))
+        let mut buf = [0u8; 24];
+        buf[0] = b'S'; buf[1] = b'N'; buf[2] = b'-';
+        let mut end = 24usize;
+        let mut v = if n == 0 { 1u64 } else { n };
+        while v > 0 {
+            end -= 1;
+            buf[end] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        let digit_len = 24 - end;
+        let mut out = [0u8; 24];
+        out[0] = b'S'; out[1] = b'N'; out[2] = b'-';
+        out[3..3 + digit_len].copy_from_slice(&buf[end..24]);
+        let s = core::str::from_utf8(&out[..3 + digit_len]).unwrap_or("SN-1");
+        String::from_str(env, s)
     }
 
     /// Wrapper: register_asset with an auto-generated unique serial number.
     fn reg(client: &AssetRegistryClient, env: &Env, asset_type: Symbol, metadata: String, owner: &Address) -> u64 {
-        client.register_asset(&asset_type, &metadata, &unique_serial(&env), &unique_serial(env), owner)
+        client.register_asset(&asset_type, &metadata, &unique_serial(env), owner)
     }
 
     /// Wrapper: try_register_asset with an auto-generated unique serial number.
-    fn try_reg(client: &AssetRegistryClient, env: &Env, asset_type: Symbol, metadata: String, owner: &Address) -> Result<u64, soroban_sdk::InvokeError> {
-        client.try_register_asset(&asset_type, &metadata, &unique_serial(&env), &unique_serial(env), owner)
+    #[allow(dead_code)]
+    fn try_reg(client: &AssetRegistryClient, env: &Env, asset_type: Symbol, metadata: String, owner: &Address) -> Result<Result<u64, soroban_sdk::Error>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>> {
+        client.try_register_asset(&asset_type, &metadata, &unique_serial(env), owner)
     }
 
     #[test]
@@ -2723,6 +2817,7 @@ mod tests {
         batch.push_back(AssetInput {
             asset_type: symbol_short!("GENSET"),
             metadata: String::from_str(&env, "A"),
+            serial_number: unique_serial(&env),
         });
 
         let result = client.try_batch_register_assets(&owner, &batch);
@@ -2751,10 +2846,12 @@ mod tests {
         batch.push_back(AssetInput {
             asset_type: symbol_short!("GENSET"),
             metadata: String::from_str(&env, "A"),
+            serial_number: unique_serial(&env),
         });
         batch.push_back(AssetInput {
             asset_type: symbol_short!("GENSET"),
             metadata: String::from_str(&env, "B"),
+            serial_number: unique_serial(&env),
         });
 
         let ids = client.batch_register_assets(&owner, &batch);
@@ -2851,6 +2948,7 @@ mod tests {
             client.try_register_asset(
                 &symbol_short!("GENSET"),
                 &String::from_str(&env, "A"),
+                &unique_serial(&env),
                 &owner
             ),
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -2907,10 +3005,12 @@ mod tests {
         batch.push_back(AssetInput {
             asset_type: symbol_short!("GENSET"),
             metadata: String::from_str(&env, "Duplicate"),
+            serial_number: unique_serial(&env),
         });
         batch.push_back(AssetInput {
             asset_type: symbol_short!("GENSET"),
             metadata: String::from_str(&env, "Duplicate"),
+            serial_number: unique_serial(&env),
         });
 
         let result = client.try_batch_register_assets(&owner, &batch);
@@ -2938,10 +3038,12 @@ mod tests {
         batch.push_back(AssetInput {
             asset_type: symbol_short!("GENSET"),
             metadata: String::from_str(&env, "A"),
+            serial_number: unique_serial(&env),
         });
         batch.push_back(AssetInput {
             asset_type: symbol_short!("GENSET"),
             metadata: String::from_str(&env, "B"),
+            serial_number: unique_serial(&env),
         });
 
         let ids = client.batch_register_assets(&owner, &batch);
@@ -3008,14 +3110,17 @@ mod tests {
         batch.push_back(AssetInput {
             asset_type: symbol_short!("GENSET"),
             metadata: String::from_str(&env, "A"),
+            serial_number: unique_serial(&env),
         });
         batch.push_back(AssetInput {
             asset_type: symbol_short!("GENSET"),
             metadata: String::from_str(&env, "B"),
+            serial_number: unique_serial(&env),
         });
         batch.push_back(AssetInput {
             asset_type: symbol_short!("GENSET"),
             metadata: String::from_str(&env, "C"),
+            serial_number: unique_serial(&env),
         });
 
         let ids = client.batch_register_assets(&owner, &batch);
@@ -3118,10 +3223,12 @@ mod tests {
         batch.push_back(AssetInput {
             asset_type: symbol_short!("VALID"),
             metadata: String::from_str(&env, "Meta 1"),
+            serial_number: unique_serial(&env),
         });
         batch.push_back(AssetInput {
             asset_type: symbol_short!("JUNK"),
             metadata: String::from_str(&env, "Meta 2"),
+            serial_number: unique_serial(&env),
         });
 
         let result = client.try_batch_register_assets(&owner, &batch);
@@ -3513,9 +3620,9 @@ mod tests {
 
         let admin = Address::generate(&env);
         // Simulate expiry then re-init
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         wipe_instance(&env, &contract_id);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
 
         client.pause(&admin);
         let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
@@ -3530,10 +3637,10 @@ mod tests {
         let client = AssetRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.pause(&admin);
         wipe_instance(&env, &contract_id);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
 
         client.unpause(&admin);
         let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
@@ -3548,9 +3655,9 @@ mod tests {
         let client = AssetRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         wipe_instance(&env, &contract_id);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
 
         let new_admin = Address::generate(&env);
         client.propose_admin(&admin, &new_admin);
@@ -3567,7 +3674,7 @@ mod tests {
 
         let admin = Address::generate(&env);
         let new_admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.propose_admin(&admin, &new_admin);
 
         // Simulate partial expiry (keep admin + pending_admin intact)
@@ -3586,9 +3693,9 @@ mod tests {
         let client = AssetRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         wipe_instance(&env, &contract_id);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
 
         let hash = BytesN::from_array(&env, &[0xabu8; 32]);
         client.propose_upgrade(&admin, &hash);
@@ -3608,14 +3715,14 @@ mod tests {
         let client = AssetRegistryClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         // Simulate instance TTL expiry
         wipe_instance(&env, &contract_id);
 
         // Re-initialize admin
-        client.initialize_admin(&admin);
+        client.initialize_admin(&admin, &admin);
 
         // All admin ops must succeed and extend TTL
         client.pause(&admin);
@@ -3735,7 +3842,6 @@ mod tests {
         let deployer = Address::generate(&env);
         lifecycle_client.initialize(
             &deployer,
-            &lifecycle_admin,
             &asset_registry_id,
             &engineer_registry_id,
             &lifecycle_admin,
@@ -4021,14 +4127,17 @@ mod tests {
             AssetInput {
                 asset_type: symbol_short!("GENSET"),
                 metadata: String::from_str(&env, "Generator Batch 1"),
+                serial_number: unique_serial(&env),
             },
             AssetInput {
                 asset_type: symbol_short!("GENSET"),
                 metadata: String::from_str(&env, "Generator Batch 2"),
+                serial_number: unique_serial(&env),
             },
             AssetInput {
                 asset_type: symbol_short!("TURBINE"),
                 metadata: String::from_str(&env, "Turbine Batch 1"),
+                serial_number: unique_serial(&env),
             },
         ];
 
@@ -4592,4 +4701,113 @@ mod tests {
         assert_eq!(p0.assets.len() + p1.assets.len() + p2.assets.len(), 12);
     }
 }
+
+    // --- Issue: Block re-proposal of deregister timelock ---
+
+    #[test]
+    fn test_propose_deregister_cannot_overwrite_pending_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Propose Block Test"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        // First proposal succeeds
+        client.propose_deregister_asset(&owner, &asset_id);
+
+        // Second proposal with a pending one must fail
+        let result = client.try_propose_deregister_asset(&owner, &asset_id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ProposalAlreadyExists as u32
+            )))
+        );
+    }
+
+    // --- Issue: decommission_asset_notify freezes lifecycle score ---
+
+    #[test]
+    fn test_decommission_asset_notify_freezes_lifecycle_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // Set up all three contracts
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(engineer_registry::EngineerRegistry, ());
+        let lifecycle_id = env.register(lifecycle::Lifecycle, ());
+
+        let asset_client = AssetRegistryClient::new(&env, &asset_registry_id);
+        let eng_client = engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry_id);
+        let lc_client = lifecycle::LifecycleClient::new(&env, &lifecycle_id);
+
+        let asset_admin = Address::generate(&env);
+        let lc_admin = Address::generate(&env);
+        let eng_admin = Address::generate(&env);
+
+        asset_client.initialize_admin(&asset_admin, &asset_admin);
+        asset_client.add_asset_type(&asset_admin, &symbol_short!("GENSET"));
+
+        eng_client.initialize_admin(&eng_admin, &eng_admin);
+
+        lc_client.initialize(
+            &lc_admin,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &lc_admin,
+            &0u32,
+        );
+
+        // Register asset and engineer, then submit maintenance
+        let owner = Address::generate(&env);
+        let asset_id = asset_client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Freeze Score Test"),
+            &String::from_str(&env, "SN-FREEZE-001"),
+            &owner,
+        );
+        let issuer = Address::generate(&env);
+        let engineer = Address::generate(&env);
+        eng_client.add_trusted_issuer(&eng_admin, &issuer);
+        eng_client.register_engineer(
+            &engineer,
+            &soroban_sdk::BytesN::from_array(&env, &[1u8; 32]),
+            &issuer,
+            &31_536_000u64,
+        );
+        lc_client.authorize_engineer(&owner, &asset_id, &engineer);
+        lc_client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Pre-decommission service"),
+            &engineer,
+        );
+
+        let score_at_decommission = lc_client.get_collateral_score(&asset_id);
+        assert!(score_at_decommission > 0, "score must be non-zero before decommission");
+
+        // Decommission and notify lifecycle
+        asset_client.decommission_asset_notify(&asset_admin, &asset_id, &lifecycle_id);
+
+        // Advance time past several decay intervals
+        env.ledger().with_mut(|li| li.timestamp += 50_000_000);
+
+        // Score must be frozen — no decay after decommission
+        let score_after = lc_client.get_collateral_score(&asset_id);
+        assert_eq!(
+            score_after, score_at_decommission,
+            "lifecycle score must not decay after decommission_asset_notify"
+        );
+    }
 }
