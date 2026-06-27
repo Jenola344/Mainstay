@@ -645,6 +645,41 @@ impl LendingContract {
             .get(&TOKEN_KEY)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
     }
+
+    /// Admin-only function to pause the contract.
+    pub fn pause(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = get_admin(&env);
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        env.storage().persistent().set(&PAUSED_KEY, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
+        env.events()
+            .publish((symbol_short!("PAUSED"),), (admin.clone(),));
+    }
+
+    /// Admin-only function to unpause the contract.
+    pub fn unpause(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = get_admin(&env);
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        env.storage().persistent().set(&PAUSED_KEY, &false);
+        env.storage()
+            .persistent()
+            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
+        env.events()
+            .publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
+    }
+
+    /// Returns true if the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -1072,5 +1107,46 @@ mod tests {
             .collect();
 
         assert!(!slash_events.is_empty(), "slash should emit event");
+    }
+
+    #[test]
+    fn test_pause_state_persists_across_instance_ttl_boundary() {
+        use soroban_sdk::testutils::Ledger;
+
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (env2, contract_id, admin, _token, _deployer) = {
+            let contract_id = env.register(LendingContract, ());
+            let client = LendingContractClient::new(&env, &contract_id);
+            let deployer = Address::generate(&env);
+            let admin = Address::generate(&env);
+            let token = Address::generate(&env);
+            client.initialize(&deployer, &admin, &token, &5000);
+            (env, contract_id, admin, token, deployer)
+        };
+
+        let client = LendingContractClient::new(&env2, &contract_id);
+
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        // Advance ledger past a simulated instance TTL boundary
+        env2.ledger().with_mut(|l| l.sequence_number += 518_401);
+
+        // PAUSED_KEY lives in persistent storage — must still be true after ledger advance
+        assert!(
+            client.is_paused(),
+            "pause state must survive instance TTL boundary"
+        );
+
+        // Writes must still be blocked
+        let borrower = Address::generate(&env2);
+        assert_eq!(
+            client.try_request_loan(&borrower, &1000),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ContractPaused as u32
+            )))
+        );
     }
 }

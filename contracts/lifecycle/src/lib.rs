@@ -1178,28 +1178,38 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::HistoryCapReached);
         }
 
-        // Write all records
+        // Build all records and compute final score before any write.
         let mut score: u32 = env
             .storage()
             .persistent()
             .get(&score_key(asset_id))
             .unwrap_or(0u32);
 
+        let mut new_records: Vec<MaintenanceRecord> = Vec::new(&env);
+        let mut score_entries: Vec<ScoreEntry> = Vec::new(&env);
         for record in records.iter() {
-            score = (score + config.score_increment).min(100);
-            history.push_back(MaintenanceRecord {
+            score = score
+                .checked_add(config.score_increment)
+                .map(|s| s.min(100))
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::ScoreOverflow));
+            new_records.push_back(MaintenanceRecord {
                 asset_id,
                 task_type: record.task_type.clone(),
                 notes: record.notes.clone(),
                 engineer: engineer.clone(),
                 timestamp,
             });
-            score_history_push(
-                &env,
-                asset_id,
-                ScoreEntry { timestamp, score },
-                config.max_history,
-            );
+            score_entries.push_back(ScoreEntry { timestamp, score });
+        }
+
+        // All validation passed — now commit everything atomically.
+        for record in new_records.iter() {
+            history.push_back(record);
+        }
+        for entry in score_entries.iter() {
+            score_history_push(&env, asset_id, entry, config.max_history);
+        }
+        for record in records.iter() {
             env.events().publish(
                 (EVENT_MAINT, asset_id),
                 (record.task_type.clone(), engineer.clone(), timestamp),
@@ -1375,11 +1385,25 @@ impl Lifecycle {
             .get::<_, Vec<MaintenanceRecord>>(&history_key(asset_id))
             .map(|h| !h.is_empty())
             .unwrap_or(false);
-        if has_history && score < MIN_SCORE_WITH_HISTORY {
+        let final_score = if has_history && score < MIN_SCORE_WITH_HISTORY {
             MIN_SCORE_WITH_HISTORY
         } else {
             score
-        }
+        };
+        // Persist the computed score so stored and returned values are always consistent.
+        env.storage()
+            .persistent()
+            .set(&score_key(asset_id), &final_score);
+        env.storage()
+            .persistent()
+            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .persistent()
+            .set(&last_update_key(asset_id), &env.ledger().timestamp());
+        env.storage()
+            .persistent()
+            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        final_score
     }
 
     /// Get collateral scores for multiple assets in a single call.
@@ -4434,6 +4458,43 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_submit_no_partial_writes_on_failure() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // max_history = 0 means unlimited
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // First record is valid; second has an invalid task type — batch must fail cleanly.
+        let mut records = Vec::new(&env);
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("OIL_CHG"),
+            notes: String::from_str(&env, "valid"),
+        });
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("INVALID"),
+            notes: String::from_str(&env, "bad task"),
+        });
+
+        let result = client.try_batch_submit_maintenance(&asset_id, &records, &engineer);
+        assert!(result.is_err(), "batch should fail on invalid task type");
+
+        // Neither maintenance history nor score history should have any entries.
+        assert_eq!(
+            client.get_maintenance_history(&asset_id).len(),
+            0,
+            "HIST must be empty after failed batch"
+        );
+        assert_eq!(
+            client.get_score_history(&asset_id).len(),
+            0,
+            "SCHIST must be empty after failed batch"
+        );
+    }
+
+    #[test]
     fn test_batch_submit_fails_atomically_on_history_cap() {
         let env = Env::default();
         env.mock_all_auths();
@@ -7362,5 +7423,41 @@ mod tests {
             false
         });
         assert!(prop_event.is_some(), "PROP_RVK event must be emitted on propose_revoke_engineer_auth");
+    }
+    #[test]
+    fn test_get_collateral_score_persists_returned_value() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, eng_registry, _admin) = setup(&env, 10);
+        let asset_id = register_asset(&env, &asset_registry);
+        let engineer = Address::generate(&env);
+        let cred_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let issuer = Address::generate(&env);
+        eng_registry.register_engineer(&engineer, &cred_hash, &issuer);
+
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "oil change"),
+            &engineer,
+        );
+
+        // Call get_collateral_score and capture returned value.
+        let returned = lifecycle.get_collateral_score(&asset_id);
+
+        // Read the persisted SCORE key directly from storage.
+        let stored: u32 = env
+            .as_contract(&lifecycle.address, || {
+                env.storage()
+                    .persistent()
+                    .get(&score_key(asset_id))
+                    .unwrap_or(0u32)
+            });
+
+        assert_eq!(
+            returned, stored,
+            "stored score ({stored}) must match returned score ({returned})"
+        );
     }
 }
