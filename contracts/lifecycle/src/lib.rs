@@ -499,6 +499,7 @@ impl Lifecycle {
     ///
     /// # Panics
     /// - [`ContractError::AlreadyInitialized`] if contract has already been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if deployer is not the transaction invoker
     pub fn initialize(
         env: Env,
         deployer: Address,
@@ -507,6 +508,9 @@ impl Lifecycle {
         admin: Address,
         max_history: u32,
     ) {
+        if deployer != env.invoker() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
         deployer.require_auth();
         if env.storage().persistent().has(&CONFIG) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
