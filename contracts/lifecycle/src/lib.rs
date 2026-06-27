@@ -487,6 +487,53 @@ impl Lifecycle {
         );
     }
 
+    /// Clear all engineer authorizations for an asset after ownership transfer.
+    /// Called by new owner to invalidate previous owner's engineer authorizations.
+    ///
+    /// # Arguments
+    /// * `new_owner` - The current owner of the asset (must match registry)
+    /// * `asset_id` - The asset whose engineer authorizations should be cleared
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedOwner`] if caller is not the current owner
+    pub fn clear_engineer_authorizations(env: Env, new_owner: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        new_owner.require_auth();
+
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset =
+            asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.owner != new_owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        // Get the maintenance history to find all engineers who have worked on this asset
+        if let Some(history) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<MaintenanceRecord>>(&history_key(asset_id))
+        {
+            let mut cleared_engineers = Vec::new(&env);
+            for record in history.iter() {
+                let eng = record.engineer.clone();
+                let mut already_cleared = false;
+                for cleared in cleared_engineers.iter() {
+                    if cleared == eng {
+                        already_cleared = true;
+                        break;
+                    }
+                }
+                if !already_cleared {
+                    env.storage()
+                        .persistent()
+                        .remove(&engineer_auth_key(asset_id, &eng));
+                    cleared_engineers.push_back(eng);
+                }
+            }
+        }
+    }
+
     /// Initialize the lifecycle contract with registry addresses and configuration.
     /// Must be called once after deployment to bind dependent registries.
     ///
