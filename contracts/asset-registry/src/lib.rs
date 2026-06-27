@@ -125,14 +125,40 @@ fn require_timelock_ready(env: &Env, op: Symbol, asset_id: u64) {
         .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
+/// Global timelock key for admin-level operations (e.g., upgrade).
+fn global_timelock_key(op: Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("TL_GLOB"), op)
+}
+
+fn require_global_timelock_ready(env: &Env, op: Symbol) {
+    let key = global_timelock_key(op);
+    let mut proposal: TimelockProposal = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::ProposalNotFound));
+    if proposal.executed {
+        panic_with_error!(env, ContractError::ProposalNotFound);
+    }
+    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
+        panic_with_error!(env, ContractError::TimelockNotExpired);
+    }
+    proposal.executed = true;
+    env.storage().persistent().set(&key, &proposal);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+}
+
 /// Decommissioned flag key: asset_id → bool.
 fn decommissioned_key(asset_id: u64) -> (Symbol, u64) {
     (DECOMM_PREFIX, asset_id)
 }
 
-/// Deduplication key: (owner, sha256(metadata)) → existing asset_id.
-fn dedup_key(owner: &Address, hash: &BytesN<32>) -> (Symbol, Address, BytesN<32>) {
-    (symbol_short!("DEDUP"), owner.clone(), hash.clone())
+/// Deduplication key: (owner, asset_type, sha256(metadata)) → existing asset_id.
+/// asset_type is included so same owner+metadata with different type is not erroneously deduplicated.
+fn dedup_key(owner: &Address, asset_type: &Symbol, hash: &BytesN<32>) -> (Symbol, Address, Symbol, BytesN<32>) {
+    (symbol_short!("DEDUP"), owner.clone(), asset_type.clone(), hash.clone())
 }
 
 /// Serial-number dedup key: sha256(serial_number) → existing asset_id.
@@ -380,7 +406,7 @@ impl AssetRegistry {
         // Secondary dedup: same owner + same metadata hash.
         let meta_bytes = metadata.clone().to_xdr(&env);
         let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
-        let dk = dedup_key(&owner, &meta_hash);
+        let dk = dedup_key(&owner, &asset_type, &meta_hash);
         if env.storage().persistent().has(&dk) {
             panic_with_error!(&env, ContractError::DuplicateAsset);
         }
@@ -440,7 +466,8 @@ impl AssetRegistry {
         require_non_empty_vec(&assets, "assets");
 
         let mut ids: Vec<u64> = Vec::new(&env);
-        let mut batch_hashes: Vec<BytesN<32>> = Vec::new(&env);
+        // Track (asset_type, meta_hash) pairs to detect in-batch duplicates
+        let mut batch_type_meta: Vec<(Symbol, BytesN<32>)> = Vec::new(&env);
         let mut batch_sn_hashes: Vec<BytesN<32>> = Vec::new(&env);
 
         let mut next_id: u64 = env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0);
@@ -471,17 +498,17 @@ impl AssetRegistry {
             if env
                 .storage()
                 .persistent()
-                .has(&dedup_key(&owner, &meta_hash))
+                .has(&dedup_key(&owner, &asset_in.asset_type, &meta_hash))
             {
                 panic_with_error!(&env, ContractError::DuplicateAsset);
             }
 
-            for seen in batch_hashes.iter() {
-                if seen == meta_hash {
+            for (seen_type, seen_hash) in batch_type_meta.iter() {
+                if seen_type == asset_in.asset_type && seen_hash == meta_hash {
                     panic_with_error!(&env, ContractError::DuplicateAsset);
                 }
             }
-            batch_hashes.push_back(meta_hash.clone());
+            batch_type_meta.push_back((asset_in.asset_type.clone(), meta_hash.clone()));
 
             next_id += 1;
             let id = next_id;
@@ -501,9 +528,9 @@ impl AssetRegistry {
                 .extend_ttl(&asset_key(id), TTL_THRESHOLD, TTL_TARGET);
             env.storage()
                 .persistent()
-                .set(&dedup_key(&owner, &meta_hash), &id);
+                .set(&dedup_key(&owner, &asset_in.asset_type, &meta_hash), &id);
             env.storage().persistent().extend_ttl(
-                &dedup_key(&owner, &meta_hash),
+                &dedup_key(&owner, &asset_in.asset_type, &meta_hash),
                 TTL_THRESHOLD,
                 TTL_TARGET,
             );
@@ -996,6 +1023,7 @@ impl AssetRegistry {
         // Remove deduplication key
         let dk = dedup_key(
             &asset.owner,
+            &asset.asset_type,
             &env.crypto().sha256(&asset.metadata.to_xdr(&env)).into(),
         );
         env.storage().persistent().remove(&dk);
@@ -1052,14 +1080,14 @@ impl AssetRegistry {
         let old_hash: BytesN<32> = env.crypto().sha256(&asset.metadata.to_xdr(&env)).into();
         env.storage()
             .persistent()
-            .remove(&dedup_key(&owner, &old_hash));
+            .remove(&dedup_key(&owner, &asset.asset_type, &old_hash));
 
         // Reject if new metadata is a duplicate for this owner
         let new_hash: BytesN<32> = env
             .crypto()
             .sha256(&new_metadata.clone().to_xdr(&env))
             .into();
-        let new_dk = dedup_key(&owner, &new_hash);
+        let new_dk = dedup_key(&owner, &asset.asset_type, &new_hash);
         if env.storage().persistent().has(&new_dk) {
             panic_with_error!(&env, ContractError::DuplicateAsset);
         }
@@ -1118,12 +1146,12 @@ impl AssetRegistry {
             .into();
         env.storage()
             .persistent()
-            .remove(&dedup_key(&current_owner, &hash));
+            .remove(&dedup_key(&current_owner, &asset.asset_type, &hash));
         env.storage()
             .persistent()
-            .set(&dedup_key(&new_owner, &hash), &asset_id);
+            .set(&dedup_key(&new_owner, &asset.asset_type, &hash), &asset_id);
         env.storage().persistent().extend_ttl(
-            &dedup_key(&new_owner, &hash),
+            &dedup_key(&new_owner, &asset.asset_type, &hash),
             TTL_THRESHOLD,
             TTL_TARGET,
         );
@@ -1183,17 +1211,17 @@ impl AssetRegistry {
             .publish((symbol_short!("DECOMM"), asset_id), ledger_seq);
     }
 
-    /// Admin-only function to upgrade the contract WASM to a new hash.
-    /// This allows for contract updates while maintaining state.
+    /// Propose a WASM upgrade for the asset registry contract.
+    /// Must be followed by `execute_upgrade` after the timelock delay.
     ///
     /// # Arguments
     /// * `admin` - The admin address that must match the stored admin
-    /// * `new_wasm_hash` - The hash of the new WASM code to deploy
+    /// * `new_wasm_hash` - The hash of the new WASM to deploy
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if the admin has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+    pub fn propose_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
         ensure_not_paused(&env);
         admin.require_auth();
 
@@ -1208,11 +1236,65 @@ impl AssetRegistry {
 
         env.storage().instance().extend_ttl(518400, 518400);
 
-        #[cfg(not(test))]
-        {
-            env.deployer()
-                .update_current_contract_wasm(new_wasm_hash.clone());
+        let tl_key = global_timelock_key(symbol_short!("UPGRADE"));
+        env.storage().persistent().set(
+            &tl_key,
+            &TimelockProposal {
+                proposed_at: env.ledger().timestamp(),
+                executed: false,
+            },
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&tl_key, TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .persistent()
+            .set(&symbol_short!("PEND_UPG"), &new_wasm_hash);
+        env.storage()
+            .persistent()
+            .extend_ttl(&symbol_short!("PEND_UPG"), TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("PROP_UPG"), admin.clone()),
+            (new_wasm_hash, env.ledger().timestamp()),
+        );
+    }
+
+    /// Execute a previously proposed WASM upgrade after the timelock delay has expired.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored admin
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the admin has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::ProposalNotFound`] if no upgrade was proposed or already executed
+    /// - [`ContractError::TimelockNotExpired`] if the delay has not elapsed
+    pub fn execute_upgrade(env: Env, admin: Address) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+
+        require_global_timelock_ready(&env, symbol_short!("UPGRADE"));
+
+        let new_wasm_hash: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&symbol_short!("PEND_UPG"))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ProposalNotFound));
+        env.storage()
+            .persistent()
+            .remove(&symbol_short!("PEND_UPG"));
+
+        env.storage().instance().extend_ttl(518400, 518400);
 
         env.events().publish(
             (symbol_short!("UPGRADE"), admin.clone()),
@@ -1220,8 +1302,14 @@ impl AssetRegistry {
         );
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("UPGRADE")),
-            (admin, env.ledger().timestamp(), new_wasm_hash),
+            (admin, env.ledger().timestamp(), new_wasm_hash.clone()),
         );
+
+        #[cfg(not(test))]
+        {
+            env.deployer()
+                .update_current_contract_wasm(new_wasm_hash);
+        }
     }
 
     /// Admin-only function to allow a new asset type symbol.
@@ -1632,7 +1720,7 @@ mod tests {
         let meta_bytes = metadata.to_xdr(&env);
         let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
         let dedup_ttl = env.as_contract(&contract_id, || {
-            let dk = dedup_key(&owner, &meta_hash);
+            let dk = dedup_key(&owner, &symbol_short!("GENSET"), &meta_hash);
             env.storage().persistent().get_ttl(&dk)
         });
         assert!(dedup_ttl > 0, "Deduplication key TTL should be extended");
@@ -1658,7 +1746,7 @@ mod tests {
         let ttl = env.as_contract(&contract_id, || {
             env.storage()
                 .persistent()
-                .get_ttl(&dedup_key(&owner, &meta_hash))
+                .get_ttl(&dedup_key(&owner, &symbol_short!("GENSET"), &meta_hash))
         });
         assert!(
             ttl > 0,
@@ -1667,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn test_admin_can_upgrade() {
+    fn test_admin_can_propose_upgrade() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(AssetRegistry, ());
@@ -1677,7 +1765,7 @@ mod tests {
         client.initialize_admin(&admin, &admin);
 
         let new_wasm_hash = BytesN::from_array(&env, &[0xabu8; 32]);
-        let result = client.try_upgrade(&admin, &new_wasm_hash);
+        let result = client.try_propose_upgrade(&admin, &new_wasm_hash);
         assert_ne!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -1687,7 +1775,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_admin_cannot_upgrade() {
+    fn test_non_admin_cannot_propose_upgrade() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(AssetRegistry, ());
@@ -1699,7 +1787,7 @@ mod tests {
         let outsider = Address::generate(&env);
         let new_wasm_hash = BytesN::from_array(&env, &[0xabu8; 32]);
 
-        let result = client.try_upgrade(&outsider, &new_wasm_hash);
+        let result = client.try_propose_upgrade(&outsider, &new_wasm_hash);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -2661,7 +2749,7 @@ mod tests {
         env.as_contract(&contract_id, || {
             let meta_bytes = Bytes::from(metadata.to_xdr(&env));
             let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
-            let new_dk = dedup_key(&new_owner, &meta_hash);
+            let new_dk = dedup_key(&new_owner, &symbol_short!("GENSET"), &meta_hash);
             let dedup_ttl = env.storage().persistent().get_ttl(&new_dk);
             assert!(
                 dedup_ttl > 0,
@@ -2696,7 +2784,7 @@ mod tests {
             let new_metadata = String::from_str(&env, "Updated spec");
             let meta_bytes = Bytes::from(new_metadata.to_xdr(&env));
             let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
-            let new_dk = dedup_key(&owner, &meta_hash);
+            let new_dk = dedup_key(&owner, &symbol_short!("GENSET"), &meta_hash);
             let dedup_ttl = env.storage().persistent().get_ttl(&new_dk);
             assert!(dedup_ttl > 0, "New dedup key TTL should be extended");
 
@@ -2892,9 +2980,9 @@ mod tests {
             )))
         );
 
-        // upgrade
+        // propose_upgrade
         assert_eq!(
-            client.try_upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32])),
+            client.try_propose_upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32])),
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::Paused as u32
             )))
@@ -3610,7 +3698,10 @@ mod tests {
         client.initialize_admin(&admin, &admin);
 
         let hash = BytesN::from_array(&env, &[0xabu8; 32]);
-        client.upgrade(&admin, &hash);
+        client.propose_upgrade(&admin, &hash);
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+        client.execute_upgrade(&admin);
         let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
         assert!(ttl > 0, "upgrade must extend instance TTL");
     }
@@ -4381,6 +4472,206 @@ mod tests {
         let result = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &0, &200);
         assert_eq!(result.total, 50);
         assert_eq!(result.assets.len(), 50); // only 50 assets exist
+    }
+
+    // --- #751: dedup key includes asset_type ---
+
+    #[test]
+    fn test_same_metadata_different_type_is_allowed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+
+        let owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "Spec v1");
+
+        // Same metadata, different asset types — both should succeed
+        let id1 = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+        let id2 = client.register_asset(&symbol_short!("TURBINE"), &metadata, &unique_serial(&env), &owner);
+
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_same_owner_same_type_same_metadata_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "Spec v1");
+
+        client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+
+        let result = client.try_register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::DuplicateAsset as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_batch_same_metadata_different_type_is_allowed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+
+        let owner = Address::generate(&env);
+        let mut batch = Vec::new(&env);
+        batch.push_back(AssetInput {
+            asset_type: symbol_short!("GENSET"),
+            metadata: String::from_str(&env, "Shared spec"),
+            serial_number: unique_serial(&env),
+        });
+        batch.push_back(AssetInput {
+            asset_type: symbol_short!("TURBINE"),
+            metadata: String::from_str(&env, "Shared spec"),
+            serial_number: unique_serial(&env),
+        });
+
+        let ids = client.batch_register_assets(&owner, &batch);
+        assert_eq!(ids.len(), 2);
+    }
+
+    // --- #752: upgrade timelock tests ---
+
+    #[test]
+    fn test_execute_upgrade_before_timelock_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.propose_upgrade(&admin, &hash);
+
+        // Not enough time passed — should fail
+        let result = client.try_execute_upgrade(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TimelockNotExpired as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_execute_upgrade_after_timelock_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.propose_upgrade(&admin, &hash);
+
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
+        // Should succeed
+        client.execute_upgrade(&admin);
+    }
+
+    #[test]
+    fn test_execute_upgrade_without_proposal_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+
+        let result = client.try_execute_upgrade(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ProposalNotFound as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_propose_upgrade_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.propose_upgrade(&admin, &hash);
+
+        let events = env.events().all();
+        use soroban_sdk::TryIntoVal;
+        let prop_event = events.iter().find(|(_, topics, _)| {
+            if let Some(val) = topics.get(0) {
+                if let Ok(s) = val.try_into_val::<_, Symbol>(&env) {
+                    return s == symbol_short!("PROP_UPG");
+                }
+            }
+            false
+        });
+        assert!(prop_event.is_some(), "PROP_UPG event must be emitted on propose_upgrade");
+    }
+
+    #[test]
+    fn test_upgrade_emit_event_after_execute() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.propose_upgrade(&admin, &hash);
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+        client.execute_upgrade(&admin);
+
+        let events = env.events().all();
+        use soroban_sdk::TryIntoVal;
+        let upgrade_event = events.iter().find(|(_, topics, _)| {
+            if let Some(val) = topics.get(0) {
+                if let Ok(s) = val.try_into_val::<_, Symbol>(&env) {
+                    return s == symbol_short!("UPGRADE");
+                }
+            }
+            false
+        });
+        assert!(upgrade_event.is_some(), "UPGRADE event must be emitted on execute_upgrade");
+        let (_, _, data) = upgrade_event.unwrap();
+        let emitted_hash: BytesN<32> = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_hash, hash);
     }
 
     #[test]

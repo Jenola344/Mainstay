@@ -117,6 +117,30 @@ fn require_revoke_timelock_ready(env: &Env, engineer: &Address) {
         .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
+fn upgrade_timelock_key() -> (Symbol, Symbol) {
+    (symbol_short!("TL_GLOB"), symbol_short!("UPGRADE"))
+}
+
+fn require_upgrade_timelock_ready(env: &Env) {
+    let key = upgrade_timelock_key();
+    let mut proposal: TimelockProposal = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::ProposalNotFound));
+    if proposal.executed {
+        panic_with_error!(env, ContractError::ProposalNotFound);
+    }
+    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
+        panic_with_error!(env, ContractError::TimelockNotExpired);
+    }
+    proposal.executed = true;
+    env.storage().persistent().set(&key, &proposal);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+}
+
 fn admin_key() -> Symbol {
     symbol_short!("ADMIN")
 }
@@ -854,8 +878,17 @@ impl EngineerRegistry {
         env.storage().persistent().get(&ENGINEER_COUNT).unwrap_or(0)
     }
 
-    /// Admin-only function to upgrade the contract WASM to a new hash.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+    /// Propose a WASM upgrade for the engineer registry contract.
+    /// Must be followed by `execute_upgrade` after the timelock delay.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored admin
+    /// * `new_wasm_hash` - The hash of the new WASM to deploy
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the admin has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    pub fn propose_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
         ensure_not_paused(&env);
         admin.require_auth();
 
@@ -867,6 +900,66 @@ impl EngineerRegistry {
         if stored_admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+
+        env.storage().instance().extend_ttl(518400, 518400);
+
+        let tl_key = upgrade_timelock_key();
+        env.storage().persistent().set(
+            &tl_key,
+            &TimelockProposal {
+                proposed_at: env.ledger().timestamp(),
+                executed: false,
+            },
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&tl_key, TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .persistent()
+            .set(&symbol_short!("PEND_UPG"), &new_wasm_hash);
+        env.storage()
+            .persistent()
+            .extend_ttl(&symbol_short!("PEND_UPG"), TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("PROP_UPG"), admin.clone()),
+            (new_wasm_hash, env.ledger().timestamp()),
+        );
+    }
+
+    /// Execute a previously proposed WASM upgrade after the timelock delay has expired.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored admin
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the admin has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::ProposalNotFound`] if no upgrade was proposed or already executed
+    /// - [`ContractError::TimelockNotExpired`] if the delay has not elapsed
+    pub fn execute_upgrade(env: Env, admin: Address) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&admin_key())
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        require_upgrade_timelock_ready(&env);
+
+        let new_wasm_hash: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&symbol_short!("PEND_UPG"))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ProposalNotFound));
+        env.storage()
+            .persistent()
+            .remove(&symbol_short!("PEND_UPG"));
 
         env.storage().instance().extend_ttl(518400, 518400);
 
@@ -1188,14 +1281,14 @@ mod tests {
     }
 
     #[test]
-    fn test_admin_can_upgrade() {
+    fn test_admin_can_propose_upgrade() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
 
         let new_wasm_hash = BytesN::from_array(&env, &[0xabu8; 32]);
-        // In test env the WASM hash won't exist, so we just verify auth passes (no UnauthorizedAdmin error)
-        let result = client.try_upgrade(&admin, &new_wasm_hash);
+        // propose_upgrade should succeed for admin without UnauthorizedAdmin error
+        let result = client.try_propose_upgrade(&admin, &new_wasm_hash);
         assert!(
             result
                 != Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -1205,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_admin_cannot_upgrade() {
+    fn test_non_admin_cannot_propose_upgrade() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, _) = setup(&env);
@@ -1213,7 +1306,7 @@ mod tests {
         let outsider = Address::generate(&env);
         let new_wasm_hash = BytesN::from_array(&env, &[0xabu8; 32]);
 
-        let result = client.try_upgrade(&outsider, &new_wasm_hash);
+        let result = client.try_propose_upgrade(&outsider, &new_wasm_hash);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -1229,14 +1322,27 @@ mod tests {
         let (client, admin) = setup(&env);
 
         let new_wasm_hash = BytesN::from_array(&env, &[0xabu8; 32]);
-        client.upgrade(&admin, &new_wasm_hash);
+        client.propose_upgrade(&admin, &new_wasm_hash);
+
+        // Advance past timelock delay (48 hours)
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
+        client.execute_upgrade(&admin);
 
         let events = env.events().all();
-        assert!(events.len() >= 1); // upgrade event
-        let (_, topics, data) = events.get(0).unwrap();
+        // Find the UPGRADE event
         use soroban_sdk::TryIntoVal;
-        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(t0, symbol_short!("UPGRADE"));
+        let upgrade_event = events.iter().find(|(_, topics, _)| {
+            if let Some(val) = topics.get(0) {
+                if let Ok(s) = val.try_into_val::<_, Symbol>(&env) {
+                    return s == symbol_short!("UPGRADE");
+                }
+            }
+            false
+        });
+        assert!(upgrade_event.is_some(), "UPGRADE event must be emitted");
+        let (_, _, data) = upgrade_event.unwrap();
         let emitted_hash: BytesN<32> = data.try_into_val(&env).unwrap();
         assert_eq!(emitted_hash, new_wasm_hash);
     }
@@ -1861,9 +1967,9 @@ mod tests {
             )))
         );
 
-        // upgrade
+        // propose_upgrade
         assert_eq!(
-            client.try_upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32])),
+            client.try_propose_upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32])),
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::Paused as u32
             )))
@@ -3062,6 +3168,10 @@ mod tests {
 
     #[test]
     fn test_batch_verify_engineers_all_valid() {
+    // --- #752: upgrade timelock tests ---
+
+    #[test]
+    fn test_execute_upgrade_before_timelock_fails() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
@@ -3087,6 +3197,20 @@ mod tests {
 
     #[test]
     fn test_batch_verify_engineers_mixed() {
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.propose_upgrade(&admin, &hash);
+
+        let result = client.try_execute_upgrade(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TimelockNotExpired as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_execute_upgrade_after_timelock_succeeds() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
@@ -3116,6 +3240,17 @@ mod tests {
 
     #[test]
     fn test_batch_verify_engineers_all_invalid() {
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.propose_upgrade(&admin, &hash);
+
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
+        client.execute_upgrade(&admin);
+    }
+
+    #[test]
+    fn test_execute_upgrade_without_proposal_fails() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
@@ -3139,5 +3274,30 @@ mod tests {
         assert!(!results.get(0).unwrap(), "revoked engineer must be false");
         assert!(!results.get(1).unwrap(), "revoked engineer must be false");
         assert!(!results.get(2).unwrap(), "never-registered engineer must be false");
+        let result = client.try_execute_upgrade(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ProposalNotFound as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_propose_upgrade_non_admin_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup(&env);
+
+        let outsider = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+
+        let result = client.try_propose_upgrade(&outsider, &hash);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
     }
 }

@@ -52,6 +52,26 @@ Mainstay uses a standardized 30-day extension policy:
 | `Symbol("ENG_REG")` | Instance | Linked Engineer Registry contract address |
 | `Symbol("CONFIG")` | Instance | `Config` record (max history, decay rates, etc.) |
 
+### 4. Lending Contract
+
+| Key Pattern | Storage Type | Description |
+| ----------- | ------------ | ----------- |
+| `Symbol("ADMIN")` | Persistent | Admin address authorized for admin operations |
+| `Symbol("TOKEN")` | Persistent | Payment token contract address |
+| `Symbol("CONFIG")` | Persistent | `Config` record (yield BPS, slash BPS) |
+| `Symbol("PAUSED")` | Persistent | Contract pause flag |
+| `Symbol("SL_BAL")` | Persistent | Accumulated slash balance |
+| `Symbol("SL_BPS")` | Persistent | Slash basis points |
+| `Symbol("LOAN_DUR")` | Persistent | Loan duration in seconds |
+| `Symbol("MIN_STK")` | Persistent | Minimum vouch stake |
+| `Symbol("YIELD_BPS")` | Persistent | Yield basis points |
+| `(Symbol("LOAN"), borrower: Address)` | Persistent | `Loan` record for a borrower |
+| `(Symbol("BORR"), borrower: Address)` | Persistent | Borrower credit history record |
+| `(Symbol("VOUCHES"), borrower: Address)` | Persistent | `Vec<Vouch>` for a borrower |
+| `(Symbol("V_HIST"), voucher: Address)` | Persistent | Voucher history record |
+
+> **Issue #756 — Pause state TTL**: `PAUSED_KEY` is stored in persistent storage. `pause` and `unpause` must call `extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET)` after every write so the pause flag cannot silently expire while the contract is paused during an incident response.
+
 ## Extension Logic
 
 ### Instance Storage
@@ -77,6 +97,20 @@ Functions that extend instance TTL in **EngineerRegistry**:
 - `upgrade`
 - `add_trusted_issuer`
 - `remove_trusted_issuer`
+
+### Persistent Storage — Pause Flag (Lending Contract)
+
+The Lending Contract stores all data in persistent storage (no instance storage). The `PAUSED` key is extended on every `pause` and `unpause` call:
+
+```rust
+env.storage().persistent().extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
+```
+
+Functions that extend `PAUSED_KEY` TTL in **LendingContract**:
+- `pause`
+- `unpause`
+
+Without this extension, a contract paused during an incident could silently unpause when the persistent entry expires, defeating the safety mechanism.
 
 ### Persistent Storage
 

@@ -86,6 +86,8 @@ fn frozen_key(asset_id: u64) -> (Symbol, u64) {
 
 fn frozen_score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("FRZ_SCR"), asset_id)
+fn revoke_eng_timelock_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("RVK_TL"), asset_id, engineer.clone())
 }
 
 fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
@@ -393,6 +395,10 @@ impl Lifecycle {
 
     /// Revoke an engineer's owner-approved authorization for a specific asset.
     ///
+    /// Propose the revocation of an engineer's authorization for an asset.
+    /// The revocation is subject to a timelock to give engineers a grace period
+    /// to complete any in-progress maintenance work.
+    ///
     /// # Arguments
     /// * `owner` - The current owner of the asset
     /// * `asset_id` - The unique identifier of the asset
@@ -400,7 +406,7 @@ impl Lifecycle {
     ///
     /// # Panics
     /// - [`ContractError::UnauthorizedOwner`] if the caller is not the asset owner
-    pub fn revoke_engineer_auth(env: Env, owner: Address, asset_id: u64, engineer: Address) {
+    pub fn propose_revoke_engineer_auth(env: Env, owner: Address, asset_id: u64, engineer: Address) {
         ensure_not_paused(&env);
         owner.require_auth();
 
@@ -412,9 +418,73 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::UnauthorizedOwner);
         }
 
+        let key = revoke_eng_timelock_key(asset_id, &engineer);
+        env.storage().persistent().set(
+            &key,
+            &TimelockProposal {
+                proposed_at: env.ledger().timestamp(),
+                executed: false,
+            },
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("PROP_RVK"), owner.clone()),
+            (asset_id, engineer.clone(), env.ledger().timestamp()),
+        );
+    }
+
+    /// Execute a previously proposed engineer authorization revocation after the timelock expires.
+    ///
+    /// # Arguments
+    /// * `owner` - The current owner of the asset
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `engineer` - The engineer address whose authorization is being revoked
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedOwner`] if the caller is not the asset owner
+    /// - [`ContractError::ProposalNotFound`] if no revocation was proposed or already executed
+    /// - [`ContractError::TimelockNotExpired`] if the delay has not elapsed
+    pub fn execute_revoke_engineer_auth(env: Env, owner: Address, asset_id: u64, engineer: Address) {
+        ensure_not_paused(&env);
+        owner.require_auth();
+
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset =
+            asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.owner != owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        let key = revoke_eng_timelock_key(asset_id, &engineer);
+        let mut proposal: TimelockProposal = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ProposalNotFound));
+        if proposal.executed {
+            panic_with_error!(&env, ContractError::ProposalNotFound);
+        }
+        if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
+            panic_with_error!(&env, ContractError::TimelockNotExpired);
+        }
+        proposal.executed = true;
+        env.storage().persistent().set(&key, &proposal);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
         env.storage()
             .persistent()
             .remove(&engineer_auth_key(asset_id, &engineer));
+
+        env.events().publish(
+            (symbol_short!("RVK_ENG"), owner.clone()),
+            (asset_id, engineer.clone(), env.ledger().timestamp()),
+        );
     }
 
     /// Initialize the lifecycle contract with registry addresses and configuration.
@@ -1131,28 +1201,38 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::HistoryCapReached);
         }
 
-        // Write all records
+        // Build all records and compute final score before any write.
         let mut score: u32 = env
             .storage()
             .persistent()
             .get(&score_key(asset_id))
             .unwrap_or(0u32);
 
+        let mut new_records: Vec<MaintenanceRecord> = Vec::new(&env);
+        let mut score_entries: Vec<ScoreEntry> = Vec::new(&env);
         for record in records.iter() {
-            score = (score + config.score_increment).min(100);
-            history.push_back(MaintenanceRecord {
+            score = score
+                .checked_add(config.score_increment)
+                .map(|s| s.min(100))
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::ScoreOverflow));
+            new_records.push_back(MaintenanceRecord {
                 asset_id,
                 task_type: record.task_type.clone(),
                 notes: record.notes.clone(),
                 engineer: engineer.clone(),
                 timestamp,
             });
-            score_history_push(
-                &env,
-                asset_id,
-                ScoreEntry { timestamp, score },
-                config.max_history,
-            );
+            score_entries.push_back(ScoreEntry { timestamp, score });
+        }
+
+        // All validation passed — now commit everything atomically.
+        for record in new_records.iter() {
+            history.push_back(record);
+        }
+        for entry in score_entries.iter() {
+            score_history_push(&env, asset_id, entry, config.max_history);
+        }
+        for record in records.iter() {
             env.events().publish(
                 (EVENT_MAINT, asset_id),
                 (record.task_type.clone(), engineer.clone(), timestamp),
@@ -1405,11 +1485,25 @@ impl Lifecycle {
             .get::<_, Vec<MaintenanceRecord>>(&history_key(asset_id))
             .map(|h| !h.is_empty())
             .unwrap_or(false);
-        if has_history && score < MIN_SCORE_WITH_HISTORY {
+        let final_score = if has_history && score < MIN_SCORE_WITH_HISTORY {
             MIN_SCORE_WITH_HISTORY
         } else {
             score
-        }
+        };
+        // Persist the computed score so stored and returned values are always consistent.
+        env.storage()
+            .persistent()
+            .set(&score_key(asset_id), &final_score);
+        env.storage()
+            .persistent()
+            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .persistent()
+            .set(&last_update_key(asset_id), &env.ledger().timestamp());
+        env.storage()
+            .persistent()
+            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        final_score
     }
 
     /// Get collateral scores for multiple assets in a single call.
@@ -1778,17 +1872,17 @@ impl Lifecycle {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
     }
 
-    /// Admin-only function to upgrade the contract WASM to a new hash.
-    /// This allows for contract updates while maintaining state.
+    /// Propose a WASM upgrade for the lifecycle contract.
+    /// The upgrade must be executed after the timelock delay has passed.
     ///
     /// # Arguments
     /// * `admin` - The admin address that must match the stored config admin
-    /// * `new_wasm_hash` - The hash of the new WASM code to deploy
+    /// * `new_wasm_hash` - The hash of the new WASM to deploy
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+    pub fn propose_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
         ensure_not_paused(&env);
         admin.require_auth();
 
@@ -1800,6 +1894,54 @@ impl Lifecycle {
         if config.admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+
+        store_timelock(&env, symbol_short!("UPGRADE"));
+        env.storage()
+            .persistent()
+            .set(&symbol_short!("PEND_UPG"), &new_wasm_hash);
+        env.storage()
+            .persistent()
+            .extend_ttl(&symbol_short!("PEND_UPG"), TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("PROP_UPG"), admin.clone()),
+            (new_wasm_hash, env.ledger().timestamp()),
+        );
+    }
+
+    /// Execute a previously proposed WASM upgrade after the timelock delay has expired.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::ProposalNotFound`] if no upgrade was proposed or already executed
+    /// - [`ContractError::TimelockNotExpired`] if the delay has not elapsed
+    pub fn execute_upgrade(env: Env, admin: Address) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        require_timelock_ready(&env, symbol_short!("UPGRADE"));
+
+        let new_wasm_hash: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&symbol_short!("PEND_UPG"))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ProposalNotFound));
+        env.storage()
+            .persistent()
+            .remove(&symbol_short!("PEND_UPG"));
 
         env.events().publish(
             (symbol_short!("UPGRADE"), admin.clone()),
@@ -3934,15 +4076,15 @@ mod tests {
     // --- Upgrade tests ---
 
     #[test]
-    fn test_admin_can_upgrade() {
+    fn test_admin_can_propose_upgrade() {
         let env = Env::default();
         env.mock_all_auths();
 
         let (client, _, _, admin) = setup(&env, 0);
         let new_wasm_hash = BytesN::from_array(&env, &[0xabu8; 32]);
 
-        // In test env WASM won't exist; verify no UnauthorizedAdmin error is returned
-        let result = client.try_upgrade(&admin, &new_wasm_hash);
+        // propose_upgrade should succeed for admin
+        let result = client.try_propose_upgrade(&admin, &new_wasm_hash);
         assert!(
             result
                 != Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -3952,7 +4094,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_admin_cannot_upgrade() {
+    fn test_non_admin_cannot_propose_upgrade() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -3960,7 +4102,7 @@ mod tests {
         let outsider = Address::generate(&env);
         let new_wasm_hash = BytesN::from_array(&env, &[0xabu8; 32]);
 
-        let result = client.try_upgrade(&outsider, &new_wasm_hash);
+        let result = client.try_propose_upgrade(&outsider, &new_wasm_hash);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -3977,14 +4119,26 @@ mod tests {
         let (client, _, _, admin) = setup(&env, 0);
         let new_wasm_hash = BytesN::from_array(&env, &[0xabu8; 32]);
 
-        client.upgrade(&admin, &new_wasm_hash);
+        client.propose_upgrade(&admin, &new_wasm_hash);
+
+        // Advance past timelock delay (48 hours)
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
+        client.execute_upgrade(&admin);
 
         let events = env.events().all();
-        assert!(events.len() >= 1);
-        let (_, topics, data) = events.get(0).unwrap();
         use soroban_sdk::TryIntoVal;
-        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(t0, symbol_short!("UPGRADE"));
+        let upgrade_event = events.iter().find(|(_, topics, _)| {
+            if let Some(val) = topics.get(0) {
+                if let Ok(s) = val.try_into_val::<_, Symbol>(&env) {
+                    return s == symbol_short!("UPGRADE");
+                }
+            }
+            false
+        });
+        assert!(upgrade_event.is_some(), "UPGRADE event must be emitted");
+        let (_, _, data) = upgrade_event.unwrap();
         let emitted_hash: BytesN<32> = data.try_into_val(&env).unwrap();
         assert_eq!(emitted_hash, new_wasm_hash);
     }
@@ -4465,6 +4619,43 @@ mod tests {
         let history = client.get_engineer_maintenance_history(&engineer);
         let asset_count = history.iter().filter(|id| *id == asset_id).count();
         assert_eq!(asset_count, 1);
+    }
+
+    #[test]
+    fn test_batch_submit_no_partial_writes_on_failure() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // max_history = 0 means unlimited
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // First record is valid; second has an invalid task type — batch must fail cleanly.
+        let mut records = Vec::new(&env);
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("OIL_CHG"),
+            notes: String::from_str(&env, "valid"),
+        });
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("INVALID"),
+            notes: String::from_str(&env, "bad task"),
+        });
+
+        let result = client.try_batch_submit_maintenance(&asset_id, &records, &engineer);
+        assert!(result.is_err(), "batch should fail on invalid task type");
+
+        // Neither maintenance history nor score history should have any entries.
+        assert_eq!(
+            client.get_maintenance_history(&asset_id).len(),
+            0,
+            "HIST must be empty after failed batch"
+        );
+        assert_eq!(
+            client.get_score_history(&asset_id).len(),
+            0,
+            "SCHIST must be empty after failed batch"
+        );
     }
 
     #[test]
@@ -6140,9 +6331,9 @@ mod tests {
             )))
         );
 
-        // upgrade
+        // propose_upgrade
         assert_eq!(
-            client.try_upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32])),
+            client.try_propose_upgrade(&admin, &BytesN::from_array(&env, &[0u8; 32])),
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::Paused as u32
             )))
@@ -7271,5 +7462,212 @@ mod tests {
         assert_eq!(t0, symbol_short!("UPD_NOTES"));
         let emitted_max: u32 = data.try_into_val(&env).unwrap();
         assert_eq!(emitted_max, 128);
+    }
+
+    // --- #752: upgrade timelock tests ---
+
+    #[test]
+    fn test_execute_upgrade_before_timelock_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _, admin) = setup(&env, 0);
+
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.propose_upgrade(&admin, &hash);
+
+        let result = client.try_execute_upgrade(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TimelockNotExpired as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_execute_upgrade_after_timelock_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _, admin) = setup(&env, 0);
+
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.propose_upgrade(&admin, &hash);
+
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
+        client.execute_upgrade(&admin);
+    }
+
+    #[test]
+    fn test_execute_upgrade_without_proposal_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _, admin) = setup(&env, 0);
+
+        let result = client.try_execute_upgrade(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ProposalNotFound as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_propose_upgrade_non_admin_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _, _) = setup(&env, 0);
+        let outsider = Address::generate(&env);
+
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        let result = client.try_propose_upgrade(&outsider, &hash);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    // --- #753: revoke_engineer_auth timelock tests ---
+
+    #[test]
+    fn test_propose_revoke_engineer_auth_and_execute_after_delay() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_registry, engineer_registry, _admin) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry, &owner);
+        let engineer = register_engineer(&env, &engineer_registry);
+
+        client.authorize_engineer(&owner, &asset_id, &engineer);
+
+        // Propose revocation
+        client.propose_revoke_engineer_auth(&owner, &asset_id, &engineer);
+
+        // Execute before timelock — should fail
+        let result = client.try_execute_revoke_engineer_auth(&owner, &asset_id, &engineer);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TimelockNotExpired as u32,
+            ))),
+        );
+
+        // Advance past timelock delay (48 hours)
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
+        // Execute after delay — should succeed
+        client.execute_revoke_engineer_auth(&owner, &asset_id, &engineer);
+    }
+
+    #[test]
+    fn test_execute_revoke_engineer_auth_without_proposal_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_registry, engineer_registry, _admin) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry, &owner);
+        let engineer = register_engineer(&env, &engineer_registry);
+
+        client.authorize_engineer(&owner, &asset_id, &engineer);
+
+        // Execute without proposal — should fail
+        let result = client.try_execute_revoke_engineer_auth(&owner, &asset_id, &engineer);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ProposalNotFound as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_propose_revoke_engineer_auth_non_owner_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_registry, engineer_registry, _admin) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let rogue = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry, &owner);
+        let engineer = register_engineer(&env, &engineer_registry);
+
+        client.authorize_engineer(&owner, &asset_id, &engineer);
+
+        let result = client.try_propose_revoke_engineer_auth(&rogue, &asset_id, &engineer);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedOwner as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_propose_revoke_engineer_auth_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_registry, engineer_registry, _admin) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry, &owner);
+        let engineer = register_engineer(&env, &engineer_registry);
+
+        client.authorize_engineer(&owner, &asset_id, &engineer);
+        client.propose_revoke_engineer_auth(&owner, &asset_id, &engineer);
+
+        let events = env.events().all();
+        use soroban_sdk::TryIntoVal;
+        let prop_event = events.iter().find(|(_, topics, _)| {
+            if let Some(val) = topics.get(0) {
+                if let Ok(s) = val.try_into_val::<_, Symbol>(&env) {
+                    return s == symbol_short!("PROP_RVK");
+                }
+            }
+            false
+        });
+        assert!(prop_event.is_some(), "PROP_RVK event must be emitted on propose_revoke_engineer_auth");
+    }
+    #[test]
+    fn test_get_collateral_score_persists_returned_value() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, eng_registry, _admin) = setup(&env, 10);
+        let asset_id = register_asset(&env, &asset_registry);
+        let engineer = Address::generate(&env);
+        let cred_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let issuer = Address::generate(&env);
+        eng_registry.register_engineer(&engineer, &cred_hash, &issuer);
+
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "oil change"),
+            &engineer,
+        );
+
+        // Call get_collateral_score and capture returned value.
+        let returned = lifecycle.get_collateral_score(&asset_id);
+
+        // Read the persisted SCORE key directly from storage.
+        let stored: u32 = env
+            .as_contract(&lifecycle.address, || {
+                env.storage()
+                    .persistent()
+                    .get(&score_key(asset_id))
+                    .unwrap_or(0u32)
+            });
+
+        assert_eq!(
+            returned, stored,
+            "stored score ({stored}) must match returned score ({returned})"
+        );
     }
 }
