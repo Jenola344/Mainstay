@@ -2149,6 +2149,48 @@ impl Lifecycle {
                 env.storage()
                     .persistent()
                     .extend_ttl(&history_key, TTL_THRESHOLD, TTL_TARGET);
+
+                // Remove asset from engineer index for engineers whose records were
+                // entirely dropped (i.e. they appear only in the pruned prefix).
+                let mut retained_engs: Vec<Address> = Vec::new(&env);
+                for i in start_idx..history.len() {
+                    let eng = history.get(i).unwrap().engineer;
+                    let mut found = false;
+                    for existing in retained_engs.iter() {
+                        if existing == eng {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        retained_engs.push_back(eng);
+                    }
+                }
+                let mut removed_engs: Vec<Address> = Vec::new(&env);
+                for i in 0..start_idx {
+                    let eng = history.get(i).unwrap().engineer;
+                    let mut in_retained = false;
+                    for existing in retained_engs.iter() {
+                        if existing == eng {
+                            in_retained = true;
+                            break;
+                        }
+                    }
+                    if in_retained {
+                        continue;
+                    }
+                    let mut already_removed = false;
+                    for existing in removed_engs.iter() {
+                        if existing == eng {
+                            already_removed = true;
+                            break;
+                        }
+                    }
+                    if !already_removed {
+                        removed_engs.push_back(eng.clone());
+                        engineer_history_remove(&env, &eng, asset_id);
+                    }
+                }
             }
         }
 
@@ -3195,6 +3237,66 @@ mod tests {
         assert_eq!(
             last_before.timestamp, last_after.timestamp,
             "Most recent entries should be kept"
+        );
+    }
+
+    #[test]
+    fn test_prune_asset_history_cleans_engineer_index() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // max_history starts at 10
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 10);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+
+        // Two engineers: eng_a submits the first 5 records, eng_b submits the next 5
+        let eng_a = register_engineer(&env, &engineer_registry_client);
+        let eng_b = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &eng_a);
+        client.authorize_engineer(&asset_owner, &asset_id, &eng_b);
+
+        for _ in 0..5 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("INSPECT"),
+                &String::from_str(&env, "Early check"),
+                &eng_a,
+            );
+        }
+        for _ in 0..5 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "Later check"),
+                &eng_b,
+            );
+        }
+
+        // Both engineers should be in the index before pruning
+        assert!(client
+            .get_engineer_maintenance_history(&eng_a)
+            .contains(&asset_id));
+        assert!(client
+            .get_engineer_maintenance_history(&eng_b)
+            .contains(&asset_id));
+
+        // Reduce max_history to 5 so eng_a's records are entirely pruned
+        client.update_max_history(&admin, &5);
+        client.prune_asset_history(&admin, &asset_id);
+
+        // eng_a no longer has any retained records → must be removed from index
+        assert!(
+            !client
+                .get_engineer_maintenance_history(&eng_a)
+                .contains(&asset_id),
+            "eng_a should be removed from engineer index after all their records are pruned"
+        );
+        // eng_b still has retained records → must remain in index
+        assert!(
+            client
+                .get_engineer_maintenance_history(&eng_b)
+                .contains(&asset_id),
+            "eng_b should remain in engineer index because their records were kept"
         );
     }
 
