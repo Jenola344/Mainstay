@@ -6906,6 +6906,151 @@ mod tests {
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
         let (asset1, asset1_owner) = register_asset(&env, &asset_registry_client);
+
+    #[test]
+    fn test_emergency_pause_blocks_maintenance_submission() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Can submit before pause
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "before pause"),
+            &engineer,
+        );
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
+
+        // Pause contract
+        client.pause(&admin);
+
+        // Cannot submit after pause
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &String::from_str(&env, "after pause"),
+            &engineer,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::Paused as u32
+            )))
+        );
+
+        // History should not have grown
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
+    }
+
+    #[test]
+    fn test_emergency_pause_blocks_score_updates() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Submit maintenance and verify score increases
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "maintenance 1"),
+            &engineer,
+        );
+        let initial_score = client.get_collateral_score(&asset_id);
+        assert!(initial_score > 0);
+
+        // Pause contract
+        client.pause(&admin);
+
+        // Cannot reset score while paused
+        let result = client.try_reset_score(&admin, &asset_id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::Paused as u32
+            )))
+        );
+
+        // Score should not have changed
+        assert_eq!(client.get_collateral_score(&asset_id), initial_score);
+    }
+
+    #[test]
+    fn test_emergency_unpause_restores_functionality() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Pause and then unpause
+        client.pause(&admin);
+        assert!(client.is_paused());
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+
+        // Can submit after unpause
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "after unpause"),
+            &engineer,
+        );
+
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
+    }
+
+    #[test]
+    fn test_pause_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _admin) = setup(&env, 0);
+        let not_admin = Address::generate(&env);
+
+        let result = client.try_pause(&not_admin);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32
+            )))
+        );
+
+        // Contract should not be paused
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_unpause_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        let not_admin = Address::generate(&env);
+        let result = client.try_unpause(&not_admin);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32
+            )))
+        );
+
+        // Contract should still be paused
+        assert!(client.is_paused());
+    }
         let (asset2, asset2_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset1_owner, &asset1, &engineer);
