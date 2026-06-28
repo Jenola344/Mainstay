@@ -440,13 +440,24 @@ impl EngineerRegistry {
     /// Renew an engineer's credential by extending the expiry.
     /// Only the original issuer can renew credentials.
     ///
+    /// ## Renewal semantics
+    ///
+    /// The new `expires_at` is calculated as:
+    /// - **Not yet expired**: `current expires_at + new_validity_period`
+    ///   (remaining validity is preserved; the new period is stacked on top)
+    /// - **Already expired**: `now + new_validity_period`
+    ///   (credential is reactivated from the current ledger timestamp)
+    ///
     /// # Arguments
     /// * `engineer` - The address of the engineer whose credential should be renewed
-    /// * `new_validity_period` - Duration in seconds from now for the renewed credential
+    /// * `new_validity_period` - Duration in seconds to add to the credential's expiry
+    ///   (stacked on top of remaining validity when called before expiry)
     ///
     /// # Panics
     /// - [`ContractError::EngineerNotFound`] if no engineer exists with the given address
     /// - [`ContractError::CredentialRevoked`] if the credential has been revoked
+    /// - [`ContractError::IssuerRemoved`] if the issuer is no longer trusted
+    /// - [`ContractError::InvalidValidityPeriod`] if `new_validity_period` is below the minimum
     pub fn renew_credential(env: Env, engineer: Address, new_validity_period: u64) {
         ensure_not_paused(&env);
         let mut record: Engineer = env
@@ -2056,6 +2067,52 @@ mod tests {
 
         let record = client.get_engineer(&engineer);
         assert_eq!(record.expires_at, env.ledger().timestamp() + 86_400);
+    }
+
+    #[test]
+    fn test_renew_credential_early_renewal_preserves_remaining_validity() {
+        // An engineer renews while 25 days are still left on their credential.
+        // The new period should stack on top of the remaining validity, not replace it.
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[2u8; 32]);
+
+        const DAY: u64 = 86_400;
+        let initial_validity: u64 = 30 * DAY; // 30-day credential
+        let elapsed: u64 = 5 * DAY;           // renew after 5 days (25 days remain)
+        let new_validity: u64 = 30 * DAY;     // add another 30 days
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &initial_validity);
+
+        let original = client.get_engineer(&engineer);
+        let now_before_renewal = original.issued_at; // ledger starts at issued_at
+
+        // Advance ledger by 5 days (25 days of original validity still remain)
+        env.ledger().with_mut(|li| li.timestamp = now_before_renewal + elapsed);
+
+        client.renew_credential(&engineer, &new_validity);
+
+        let renewed = client.get_engineer(&engineer);
+
+        // Expected: original expiry (now + 25 days) + 30 new days = now + 55 days
+        let expected_expires_at = original.expires_at + new_validity;
+        assert_eq!(
+            renewed.expires_at,
+            expected_expires_at,
+            "Early renewal must extend from current expires_at, not from now"
+        );
+
+        // Sanity: the result is strictly more than just `now + new_validity` (remaining days preserved)
+        let now = env.ledger().timestamp();
+        assert!(
+            renewed.expires_at > now + new_validity,
+            "New expiry should exceed now + new_validity because remaining validity was stacked"
+        );
     }
 
     #[test]
