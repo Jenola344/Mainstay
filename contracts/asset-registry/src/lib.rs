@@ -4814,4 +4814,75 @@ mod tests {
             "lifecycle score must not decay after decommission_asset_notify"
         );
     }
+
+    // --- get_asset_status Tests ---
+
+    #[test]
+    fn test_get_asset_status_active() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Generator"), &owner);
+
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::Active);
+    }
+
+    #[test]
+    fn test_get_asset_status_decommissioned() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Generator"), &owner);
+
+        client.decommission_asset(&admin, &asset_id);
+
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::Decommissioned);
+    }
+
+    #[test]
+    fn test_get_asset_status_under_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Generator"), &owner);
+
+        client.mark_under_maintenance(&owner, &asset_id);
+
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::UnderMaintenance);
+    }
+
+    #[test]
+    #[should_panic(expected = "AssetNotFound")]
+    fn test_get_asset_status_unknown_asset_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+
+        client.asset_status(&999);
+    }
 }

@@ -581,6 +581,25 @@ impl EngineerRegistry {
         }
     }
 
+    /// Lightweight check to determine if an engineer is currently active.
+    /// Returns false for unknown addresses instead of panicking.
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer to check
+    ///
+    /// # Returns
+    /// true if the engineer exists, has active credentials, and is not expired or in grace period expiry
+    pub fn is_engineer_active(env: Env, engineer: Address) -> bool {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, Engineer>(&engineer_key(&engineer))
+        {
+            Some(e) => e.active && env.ledger().timestamp() < e.expires_at,
+            None => false,
+        }
+    }
+
     /// Initialize the admin address for the contract.
     /// This function should be called once immediately after deployment.
     ///
@@ -3383,5 +3402,70 @@ mod tests {
                 ContractError::UnauthorizedAdmin as u32,
             ))),
         );
+    }
+
+    // --- is_engineer_active Tests ---
+
+    #[test]
+    fn test_is_engineer_active_returns_false_for_unknown_engineer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+
+        let unknown_engineer = Address::generate(&env);
+        assert!(!client.is_engineer_active(&unknown_engineer));
+    }
+
+    #[test]
+    fn test_is_engineer_active_returns_true_for_active_engineer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+
+        assert!(client.is_engineer_active(&engineer));
+    }
+
+    #[test]
+    fn test_is_engineer_active_returns_false_for_revoked_engineer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+        assert!(client.is_engineer_active(&engineer));
+
+        client.revoke_credential(&engineer);
+        assert!(!client.is_engineer_active(&engineer));
+    }
+
+    #[test]
+    fn test_is_engineer_active_returns_false_for_expired_engineer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &100); // 100 seconds expiry
+
+        // Set ledger time to 101 seconds (after expiry)
+        env.ledger().with_timestamp(101);
+
+        assert!(!client.is_engineer_active(&engineer));
     }
 }
