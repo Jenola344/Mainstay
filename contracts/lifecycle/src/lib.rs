@@ -1743,6 +1743,39 @@ impl Lifecycle {
         result
     }
 
+    /// Get a paginated list of asset IDs that an engineer has worked on.
+    /// Supports offset and limit for pagination.
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer to query
+    /// * `offset` - Zero-based start index for pagination
+    /// * `limit` - Maximum number of records to return (returns empty vec if 0)
+    ///
+    /// # Returns
+    /// Vec containing the requested page of asset IDs
+    pub fn get_engineer_history(env: Env, engineer: Address, offset: u32, limit: u32) -> Vec<u64> {
+        let history: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&engineer_history_key(&engineer))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let len = history.len();
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+        if offset >= len {
+            return Vec::new(&env);
+        }
+
+        let end = (offset + limit).min(len);
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(history.get(i).unwrap());
+        }
+        page
+    }
+
     /// Return the total number of asset IDs recorded for an engineer.
     ///
     /// Use this together with [`get_eng_history_page`] to paginate through histories
@@ -6228,6 +6261,50 @@ mod tests {
         assert_eq!(client.get_eng_history_page(&engineer, &0, &0).len(), 0);
     }
 
+
+    #[test]
+    fn test_get_engineer_history_with_pagination() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Submit maintenance on 5 different assets
+        for _ in 0..5 {
+            let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+            client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "oil change"),
+                &engineer,
+            );
+        }
+
+        // First page: offset=0, limit=2 -> 2 assets
+        assert_eq!(client.get_engineer_history(&engineer, &0, &2).len(), 2);
+        // Second page: offset=2, limit=2 -> 2 assets
+        assert_eq!(client.get_engineer_history(&engineer, &2, &2).len(), 2);
+        // Third page: offset=4, limit=2 -> 1 asset (only one left)
+        assert_eq!(client.get_engineer_history(&engineer, &4, &2).len(), 1);
+        // Out-of-bounds offset -> empty
+        assert_eq!(client.get_engineer_history(&engineer, &10, &2).len(), 0);
+        // limit=0 -> empty
+        assert_eq!(client.get_engineer_history(&engineer, &0, &0).len(), 0);
+    }
+
+    #[test]
+    fn test_get_engineer_history_empty_engineer() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+        let engineer = Address::generate(&env);
+
+        // Engineer with no history should return empty
+        assert_eq!(client.get_engineer_history(&engineer, &0, &10).len(), 0);
+    }
     // --- Issue #207: decay_score extends TTL ---
 
     #[test]
