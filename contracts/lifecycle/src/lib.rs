@@ -7839,4 +7839,102 @@ mod tests {
             "stored score ({stored}) must match returned score ({returned})"
         );
     }
+
+    // --- update_max_history Tests ---
+
+    #[test]
+    fn test_update_max_history_by_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 200);
+        
+        client.update_max_history(&admin, &500);
+
+        let config: Config = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get(&(symbol_short!("CONFIG"), ()))
+                .unwrap()
+        });
+
+        assert_eq!(config.max_history, 500);
+    }
+
+    #[test]
+    fn test_update_max_history_non_admin_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 200);
+        let non_admin = Address::generate(&env);
+
+        let result = client.try_update_max_history(&non_admin, &500);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_update_max_history_zero_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 200);
+
+        let result = client.try_update_max_history(&admin, &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_update_max_history_enforced_in_submit_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 2);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Submit 2 maintenance records (at limit)
+        client.submit_maintenance(&asset_id, &symbol_short!("OIL_CHG"), &String::from_str(&env, "1"), &engineer);
+        client.submit_maintenance(&asset_id, &symbol_short!("OIL_CHG"), &String::from_str(&env, "2"), &engineer);
+        
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 2);
+
+        // Reduce max_history to 1
+        client.update_max_history(&admin, &1);
+
+        // Submit third record - should prune oldest
+        client.submit_maintenance(&asset_id, &symbol_short!("OIL_CHG"), &String::from_str(&env, "3"), &engineer);
+        
+        // History should still be at most 1 (or pruned to 1)
+        let history = client.get_maintenance_history(&asset_id);
+        assert!(history.len() <= 1, "History should not exceed new max_history limit");
+    }
+
+    #[test]
+    fn test_update_max_history_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 200);
+        client.update_max_history(&admin, &300);
+
+        let events = env.events().all();
+        assert!(events.len() >= 1);
+        use soroban_sdk::TryIntoVal;
+        let (_, topics, data) = events.get(0).unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("UPD_MAX"));
+        let emitted_max: u32 = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_max, 300);
+    }
 }
