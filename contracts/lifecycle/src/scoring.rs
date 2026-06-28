@@ -38,7 +38,13 @@ pub fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_histo
         .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
 }
 
-pub fn get_task_weight(env: &Env, task_type: &Symbol) -> u32 {
+pub fn get_task_weight(env: &Env, task_type: &Symbol, config: &Config) -> u32 {
+    // First check if task type has a configured weight
+    if let Some(weight) = config.task_weights.get(task_type.clone()) {
+        return weight;
+    }
+
+    // Fall back to default hardcoded weights
     if task_type == &symbol_short!("OIL_CHG")
         || task_type == &symbol_short!("LUBE")
         || task_type == &symbol_short!("INSPECT")

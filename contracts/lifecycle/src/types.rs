@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, String, Symbol};
+use soroban_sdk::{contracttype, Address, String, Symbol, Map};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +37,7 @@ pub struct Config {
     pub decay_interval: u64,
     pub eligibility_threshold: u32,
     pub max_notes_length: u32,
+    pub task_weights: Map<Symbol, u32>,
 }
 
 #[contracttype]
