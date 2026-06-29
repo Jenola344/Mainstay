@@ -1471,6 +1471,23 @@ impl Lifecycle {
         apply_decay(&env, asset_id, true, true, config.max_history)
     }
 
+    /// Admin-only: force time-based decay to be applied immediately for an asset.
+    ///
+    /// This is useful for marking assets that have been idle for extended periods
+    /// without waiting for the next maintenance submission.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `asset_id` - The asset to decay
+    pub fn force_decay(env: Env, admin: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+
+        // Reuse the standard decay calculation path, including history/last_update
+        // updates and DECAY event emission.
+        let _new_score = Self::decay_score(env, asset_id);
+    }
+
     /// Called by the asset registry when an asset is decommissioned.
     /// Captures the current collateral score and freezes it so that lenders
     /// see the final verified state rather than a decayed ghost score.
