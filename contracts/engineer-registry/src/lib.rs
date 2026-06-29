@@ -1,9 +1,13 @@
 #![no_std]
+use shared::error::SharedContractError;
 use shared::validation::require_within_bounds;
+use shared::{extend_persistent_ttl, TTL_THRESHOLD, TTL_TARGET};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     BytesN, Env, String, Symbol, Vec,
 };
+
+pub use shared::error::SharedContractError as SharedError;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -26,6 +30,20 @@ pub enum ContractError {
     TimelockNotExpired = 15,
     ProposalNotFound = 16,
     BatchRevokeTooLarge = 17,
+}
+
+impl From<SharedContractError> for ContractError {
+    fn from(e: SharedContractError) -> Self {
+        match e {
+            SharedContractError::NotInitialized => ContractError::NotInitialized,
+            SharedContractError::AlreadyInitialized => ContractError::AdminAlreadyInitialized,
+            SharedContractError::UnauthorizedAdmin => ContractError::UnauthorizedAdmin,
+            SharedContractError::Paused => ContractError::Paused,
+            SharedContractError::TimelockNotExpired => ContractError::TimelockNotExpired,
+            SharedContractError::ProposalNotFound => ContractError::ProposalNotFound,
+            SharedContractError::PendingAdminAlreadyExists => ContractError::PendingAdminAlreadyExists,
+        }
+    }
 }
 
 #[contracttype]
@@ -88,11 +106,6 @@ const MAX_BATCH_REVOKE: u32 = 50;
 /// Grace period allowing engineers to work after credential expiry (7 days).
 const GRACE_PERIOD_SECS: u64 = 7 * 86_400;
 
-/// Soroban persistent-storage TTL constants.
-/// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
-const TTL_THRESHOLD: u32 = 518_400;
-const TTL_TARGET: u32 = 518_400;
-
 fn is_paused(env: &Env) -> bool {
     env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
 }
@@ -118,9 +131,7 @@ fn require_revoke_timelock_ready(env: &Env, engineer: &Address) {
     }
     proposal.executed = true;
     env.storage().persistent().set(&key, &proposal);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &key);
 }
 
 fn upgrade_timelock_key() -> (Symbol, Symbol) {
@@ -142,9 +153,7 @@ fn require_upgrade_timelock_ready(env: &Env) {
     }
     proposal.executed = true;
     env.storage().persistent().set(&key, &proposal);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &key);
 }
 
 fn admin_key() -> Symbol {
@@ -200,9 +209,7 @@ impl EngineerRegistry {
                 executed: false,
             },
         );
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &key);
     }
 
     /// Execute a pending engineer credential revocation after its timelock has expired.
@@ -284,9 +291,7 @@ impl EngineerRegistry {
         env.storage()
             .persistent()
             .set(&engineer_key(&engineer), &record);
-        env.storage()
-            .persistent()
-            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &engineer_key(&engineer));
 
         // Track issuer → engineers mapping (avoid duplicates on re-registration after revoke)
         let mut list: Vec<Address> = env
@@ -300,18 +305,12 @@ impl EngineerRegistry {
         env.storage()
             .persistent()
             .set(&issuer_engineers_key(&issuer), &list);
-        env.storage().persistent().extend_ttl(
-            &issuer_engineers_key(&issuer),
-            TTL_THRESHOLD,
-            TTL_TARGET,
-        );
+        extend_persistent_ttl(&env, &issuer_engineers_key(&issuer));
 
         // Increment engineer count
         let count: u32 = env.storage().persistent().get(&ENGINEER_COUNT).unwrap_or(0);
         env.storage().persistent().set(&ENGINEER_COUNT, &(count + 1));
-        env.storage()
-            .persistent()
-            .extend_ttl(&ENGINEER_COUNT, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &ENGINEER_COUNT);
 
         // Emit engineer registration event
         env.events().publish(
@@ -417,9 +416,7 @@ impl EngineerRegistry {
         let credential_hash = record.credential_hash.clone();
         let revoked_by = record.issuer.clone();
         // Extend TTL before write to ensure consistency even on near-expired entries
-        env.storage()
-            .persistent()
-            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &engineer_key(&engineer));
         record.active = false;
         env.storage()
             .persistent()
@@ -498,9 +495,7 @@ impl EngineerRegistry {
             renewed_at
         };
         record.expires_at = renewal_base + new_validity_period;
-        env.storage()
-            .persistent()
-            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &engineer_key(&engineer));
         env.storage()
             .persistent()
             .set(&engineer_key(&engineer), &record);
@@ -719,9 +714,7 @@ impl EngineerRegistry {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().persistent().set(&PAUSED_KEY, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &PAUSED_KEY);
         env.events()
             .publish((symbol_short!("PAUSED"),), (admin.clone(),));
         env.events().publish(
@@ -741,9 +734,7 @@ impl EngineerRegistry {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().persistent().set(&PAUSED_KEY, &false);
-        env.storage()
-            .persistent()
-            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &PAUSED_KEY);
         env.events()
             .publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
         env.events().publish(
@@ -777,9 +768,7 @@ impl EngineerRegistry {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().persistent().set(&GRACE_PERIOD_KEY, &secs);
-        env.storage()
-            .persistent()
-            .extend_ttl(&GRACE_PERIOD_KEY, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &GRACE_PERIOD_KEY);
         env.events()
             .publish((symbol_short!("ADM_AUD"), symbol_short!("SET_GRACE")), (admin, secs));
     }
@@ -919,11 +908,7 @@ impl EngineerRegistry {
             {
                 if record.active {
                     record.active = false;
-                    env.storage().persistent().extend_ttl(
-                        &engineer_key(&engineer),
-                        TTL_THRESHOLD,
-                        TTL_TARGET,
-                    );
+                    extend_persistent_ttl(&env, &engineer_key(&engineer));
                     env.storage()
                         .persistent()
                         .set(&engineer_key(&engineer), &record);
@@ -1026,9 +1011,7 @@ impl EngineerRegistry {
             {
                 if record.active {
                     record.active = false;
-                    env.storage()
-                        .persistent()
-                        .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+                    extend_persistent_ttl(&env, &engineer_key(&engineer));
                     env.storage()
                         .persistent()
                         .set(&engineer_key(&engineer), &record);
@@ -1079,15 +1062,11 @@ impl EngineerRegistry {
                 executed: false,
             },
         );
-        env.storage()
-            .persistent()
-            .extend_ttl(&tl_key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &tl_key);
         env.storage()
             .persistent()
             .set(&symbol_short!("PEND_UPG"), &new_wasm_hash);
-        env.storage()
-            .persistent()
-            .extend_ttl(&symbol_short!("PEND_UPG"), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &symbol_short!("PEND_UPG"));
 
         env.events().publish(
             (symbol_short!("PROP_UPG"), admin.clone()),
