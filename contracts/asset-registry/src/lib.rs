@@ -30,6 +30,8 @@ pub enum ContractError {
     /// A new proposal cannot overwrite it; wait for the timelock to expire and execute,
     /// or allow the existing proposal to lapse before re-proposing.
     ProposalAlreadyExists = 16,
+    /// The batch exceeds the maximum allowed size.
+    BatchTooLarge = 17,
 }
 
 #[contracttype]
@@ -65,6 +67,16 @@ pub struct AssetTypePage {
     pub total: u32,
 }
 
+/// Paginated result for `get_assets_by_owner_paginated`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerPage {
+    /// Asset IDs for the requested page.
+    pub assets: Vec<u64>,
+    /// Total number of assets owned by this address across all pages.
+    pub total: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimelockProposal {
@@ -88,6 +100,9 @@ const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const ASSET_TYPE_PREFIX: Symbol = symbol_short!("AST_TYPE");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 const DECOMM_PREFIX: Symbol = symbol_short!("DECOMM");
+
+/// Maximum number of assets that may be registered in a single batch call.
+const MAX_BATCH_SIZE: u32 = 50;
 
 /// Soroban persistent-storage TTL constants.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
@@ -465,6 +480,10 @@ impl AssetRegistry {
         owner.require_auth();
         require_non_empty_vec(&assets, "assets");
 
+        if assets.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, ContractError::BatchTooLarge);
+        }
+
         let mut ids: Vec<u64> = Vec::new(&env);
         // Track (asset_type, meta_hash) pairs to detect in-batch duplicates
         let mut batch_type_meta: Vec<(Symbol, BytesN<32>)> = Vec::new(&env);
@@ -712,6 +731,53 @@ impl AssetRegistry {
             page_assets.push_back(all_assets.get(i).unwrap());
         }
         page_assets
+    }
+
+    /// Returns a page of asset IDs for the given owner together with the total count.
+    ///
+    /// # Arguments
+    /// * `owner` - The address of the asset owner
+    /// * `page` - Zero-based page index
+    /// * `page_size` - Maximum number of asset IDs per page (capped at 100)
+    ///
+    /// # Returns
+    /// `OwnerPage` containing the requested slice and the total asset count for this owner
+    pub fn get_assets_by_owner_paginated(env: Env, owner: Address, page: u32, page_size: u32) -> OwnerPage {
+        const MAX_PAGE_SIZE: u32 = 100;
+        let page_size = page_size.min(MAX_PAGE_SIZE);
+
+        let key = owner_index_key(&owner);
+        let all: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        }
+
+        let total = all.len();
+
+        if page_size == 0 {
+            return OwnerPage { assets: Vec::new(&env), total };
+        }
+
+        let offset = match page.checked_mul(page_size) {
+            Some(o) => o,
+            None => return OwnerPage { assets: Vec::new(&env), total },
+        };
+
+        if offset >= total {
+            return OwnerPage { assets: Vec::new(&env), total };
+        }
+
+        let end = (offset + page_size).min(total);
+        let mut assets = Vec::new(&env);
+        for i in offset..end {
+            assets.push_back(all.get(i).unwrap());
+        }
+
+        OwnerPage { assets, total }
     }
 
     /// Get the total count of registered assets in the system.
@@ -2431,6 +2497,45 @@ mod tests {
     }
 
     #[test]
+    fn test_get_assets_by_owner_paginated_returns_page_and_total() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id1 = client.register_asset(&symbol_short!("GENSET"), &String::from_str(&env, "P1"), &unique_serial(&env), &owner);
+        let id2 = client.register_asset(&symbol_short!("GENSET"), &String::from_str(&env, "P2"), &unique_serial(&env), &owner);
+        let id3 = client.register_asset(&symbol_short!("GENSET"), &String::from_str(&env, "P3"), &unique_serial(&env), &owner);
+
+        let page0 = client.get_assets_by_owner_paginated(&owner, &0, &2);
+        assert_eq!(page0.total, 3);
+        assert_eq!(page0.assets.len(), 2);
+        assert_eq!(page0.assets.get(0).unwrap(), id1);
+        assert_eq!(page0.assets.get(1).unwrap(), id2);
+
+        let page1 = client.get_assets_by_owner_paginated(&owner, &1, &2);
+        assert_eq!(page1.total, 3);
+        assert_eq!(page1.assets.len(), 1);
+        assert_eq!(page1.assets.get(0).unwrap(), id3);
+
+        // Out-of-range page returns empty assets but still correct total
+        let page2 = client.get_assets_by_owner_paginated(&owner, &5, &2);
+        assert_eq!(page2.total, 3);
+        assert_eq!(page2.assets.len(), 0);
+
+        // Unknown owner returns total=0
+        let unknown = Address::generate(&env);
+        let empty = client.get_assets_by_owner_paginated(&unknown, &0, &10);
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.assets.len(), 0);
+    }
+
+    #[test]
     fn test_get_assets_by_owner_updated_after_transfer() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2873,6 +2978,37 @@ mod tests {
         client.unpause(&admin);
         let id3 = client.batch_register_assets(&owner, &Vec::new(&env));
         assert_eq!(id3.len(), 0);
+    }
+
+    #[test]
+    fn test_batch_register_assets_rejects_oversized_batch() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        // Build 51 items — one over MAX_BATCH_SIZE (50)
+        let mut batch: Vec<AssetInput> = Vec::new(&env);
+        for _ in 0u32..51 {
+            batch.push_back(AssetInput {
+                asset_type: symbol_short!("GENSET"),
+                metadata: String::from_str(&env, "meta"),
+                serial_number: unique_serial(&env),
+            });
+        }
+
+        let result = client.try_batch_register_assets(&owner, &batch);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::BatchTooLarge as u32,
+            ))),
+        );
     }
 
     #[test]

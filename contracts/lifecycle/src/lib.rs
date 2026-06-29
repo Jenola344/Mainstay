@@ -1522,6 +1522,19 @@ impl Lifecycle {
         best
     }
 
+    /// View alias for [`get_last_service`].
+    /// Returns the most recent maintenance record for an asset, or `None` if no history exists.
+    /// Frontends and lenders should prefer this over fetching the full history.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// `Some(MaintenanceRecord)` for the latest record, or `None` for assets with no history
+    pub fn get_last_maintenance(env: Env, asset_id: u64) -> Option<MaintenanceRecord> {
+        Self::get_last_service(env, asset_id)
+    }
+
     /// Get the current collateral score for an asset.
     /// Verifies asset exists before returning the score.
     ///
@@ -3005,6 +3018,47 @@ mod tests {
 
         let last = client.get_last_service(&asset_id).unwrap();
         assert_eq!(last.timestamp, 2000);
+        assert_eq!(last.task_type, symbol_short!("INSPECT"));
+    }
+
+    #[test]
+    fn test_get_last_maintenance_none_for_no_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+        assert_eq!(client.get_last_maintenance(&asset_id), None);
+    }
+
+    #[test]
+    fn test_get_last_maintenance_returns_most_recent() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        env.ledger().set_timestamp(500);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "older"),
+            &engineer,
+        );
+
+        env.ledger().set_timestamp(1500);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &String::from_str(&env, "newer"),
+            &engineer,
+        );
+
+        let last = client.get_last_maintenance(&asset_id).unwrap();
+        assert_eq!(last.timestamp, 1500);
         assert_eq!(last.task_type, symbol_short!("INSPECT"));
     }
 
