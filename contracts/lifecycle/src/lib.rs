@@ -46,6 +46,7 @@ const EVENT_RST_SCR: Symbol = symbol_short!("RST_SCR");
 const EVENT_XFER: Symbol = symbol_short!("XFER");
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 const EVENT_ADMIN_SET: Symbol = symbol_short!("ADMIN_SET");
+const EVENT_PRUNED: Symbol = symbol_short!("PRUNED");
 
 /// Soroban persistent-storage TTL constants.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
@@ -1070,8 +1071,17 @@ impl Lifecycle {
             .get(&history_key(asset_id))
             .unwrap_or(Vec::new(&env));
 
-        if history.len() >= config.max_history {
-            panic_with_error!(&env, ContractError::HistoryCapReached);
+        let pruned = if config.max_history > 0 && history.len() >= config.max_history {
+            let excess = (history.len() - config.max_history + 1) as u32;
+            for _ in 0..excess {
+                history.remove(0);
+            }
+            excess
+        } else {
+            0
+        };
+        if pruned > 0 {
+            env.events().publish((EVENT_PRUNED,), (asset_id, pruned));
         }
 
         // Verify asset exists
@@ -2686,6 +2696,7 @@ mod tests {
 
     #[test]
     fn test_history_cap_enforced() {
+        // When max_history is reached, the oldest record is pruned and the new one is accepted.
         let env = Env::default();
         env.mock_all_auths();
 
@@ -2703,24 +2714,19 @@ mod tests {
             );
         }
 
-        let result = client.try_submit_maintenance(
+        // 4th submission should succeed (pruning the oldest) rather than erroring.
+        client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
             &String::from_str(&env, "over cap"),
             &engineer,
         );
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::HistoryCapReached as u32,
-            ))),
-        );
+        let history = client.get_maintenance_history(&asset_id);
+        assert_eq!(history.len(), 3);
     }
 
     #[test]
-    fn test_history_cap_checked_before_cross_contract_calls() {
-        // When the cap is already reached, HistoryCapReached must fire even if the
-        // engineer is not registered — proving the check happens before cross-contract calls.
+    fn test_pruning_event_emitted_when_history_trimmed() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -2738,8 +2744,47 @@ mod tests {
             );
         }
 
-        // Use an unregistered engineer — if cap check is first we get HistoryCapReached,
-        // not UnauthorizedEngineer.
+        // This submission crosses max_history=3, triggering a prune of 1 record.
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "triggers prune"),
+            &engineer,
+        );
+
+        let events = env.events().all();
+        let pruned_event = events.iter().find(|(_, topics, _)| {
+            topics.len() == 1
+                && topics.get(0) == Some(EVENT_PRUNED.try_into_val(&env).unwrap())
+        });
+        assert!(pruned_event.is_some(), "expected PRUNED event");
+        let (_, _, data) = pruned_event.unwrap();
+        let (emitted_asset_id, pruned_count): (u64, u32) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_asset_id, asset_id);
+        assert_eq!(pruned_count, 1u32);
+    }
+
+    #[test]
+    fn test_history_cap_checked_before_cross_contract_calls() {
+        // An unregistered engineer is still rejected even when history is at capacity.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 3);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        for _ in 0..3 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "ok"),
+                &engineer,
+            );
+        }
+
+        // Unregistered engineer should be rejected with UnauthorizedEngineer.
         let unregistered = Address::generate(&env);
         let result = client.try_submit_maintenance(
             &asset_id,
@@ -2750,7 +2795,7 @@ mod tests {
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::HistoryCapReached as u32,
+                ContractError::UnauthorizedEngineer as u32,
             ))),
         );
     }
