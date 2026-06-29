@@ -838,9 +838,6 @@ impl AssetRegistry {
     /// - [`ContractError::AdminAlreadyInitialized`] if admin has already been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if deployer is not the transaction invoker
     pub fn initialize_admin(env: Env, deployer: Address, admin: Address) {
-        if deployer != env.invoker() {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
         deployer.require_auth();
         if env.storage().instance().has(&ADMIN_KEY) {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
@@ -3132,6 +3129,116 @@ mod tests {
         assert_eq!(ids.get(0).unwrap(), 2);
         assert_eq!(ids.get(1).unwrap(), 3);
         assert_eq!(ids.get(2).unwrap(), 4);
+    }
+
+    #[test]
+    fn test_batch_register_assets_rejects_in_batch_serial_duplicate() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let shared_serial = String::from_str(&env, "SN-SAME-001");
+        let mut batch = Vec::new(&env);
+        batch.push_back(AssetInput {
+            asset_type: symbol_short!("GENSET"),
+            metadata: String::from_str(&env, "Machine A"),
+            serial_number: shared_serial.clone(),
+        });
+        batch.push_back(AssetInput {
+            asset_type: symbol_short!("GENSET"),
+            metadata: String::from_str(&env, "Machine B"),
+            serial_number: shared_serial,
+        });
+
+        let result = client.try_batch_register_assets(&owner, &batch);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::DuplicateAsset as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_batch_register_assets_rejects_invalid_asset_type() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let mut batch = Vec::new(&env);
+        batch.push_back(AssetInput {
+            asset_type: symbol_short!("GENSET"),
+            metadata: String::from_str(&env, "Valid asset"),
+            serial_number: unique_serial(&env),
+        });
+        batch.push_back(AssetInput {
+            asset_type: symbol_short!("UNKNOWN"),
+            metadata: String::from_str(&env, "Invalid type asset"),
+            serial_number: unique_serial(&env),
+        });
+
+        let result = client.try_batch_register_assets(&owner, &batch);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidAssetType as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_batch_register_assets_owner_index_correct() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+
+        // Pre-register one asset so owner index is non-empty before the batch
+        let pre_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Pre-existing"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let mut batch = Vec::new(&env);
+        batch.push_back(AssetInput {
+            asset_type: symbol_short!("GENSET"),
+            metadata: String::from_str(&env, "Batch A"),
+            serial_number: unique_serial(&env),
+        });
+        batch.push_back(AssetInput {
+            asset_type: symbol_short!("GENSET"),
+            metadata: String::from_str(&env, "Batch B"),
+            serial_number: unique_serial(&env),
+        });
+
+        let batch_ids = client.batch_register_assets(&owner, &batch);
+
+        let owned = client.get_assets_by_owner(&owner);
+        // All three IDs must be present in the owner index
+        assert_eq!(owned.len(), 3);
+        assert!(owned.contains(&pre_id));
+        assert!(owned.contains(&batch_ids.get(0).unwrap()));
+        assert!(owned.contains(&batch_ids.get(1).unwrap()));
     }
 
     #[test]

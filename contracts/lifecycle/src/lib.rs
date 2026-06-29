@@ -1084,8 +1084,6 @@ impl Lifecycle {
         use engineer_registry::CredentialStatus;
         let status = registry.verify_engineer(&engineer);
         if status != CredentialStatus::Valid {
-        let verified = registry.verify_engineer(&engineer).unwrap_or(false);
-        if !verified {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
         require_engineer_authorized(&env, asset_id, &engineer);
@@ -1282,11 +1280,6 @@ impl Lifecycle {
         use engineer_registry::CredentialStatus;
         let status = engineer_registry_client.verify_engineer(&engineer);
         if status != CredentialStatus::Valid {
-        let mut batch = Vec::new(&env);
-        batch.push_back(engineer.clone());
-        let results = engineer_registry_client.batch_verify_engineers(&batch);
-        let verified = results.get(0).unwrap_or(false);
-        if !verified {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
         require_engineer_authorized(&env, asset_id, &engineer);
