@@ -47,6 +47,17 @@ pub struct TimelockProposal {
     pub executed: bool,
 }
 
+/// A point-in-time snapshot of an asset's health, persisted independently of
+/// maintenance history so lenders can verify condition even after TTL-driven pruning.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthSnapshot {
+    pub timestamp: u64,
+    pub score: u32,
+    pub maintenance_count: u32,
+    pub last_service_date: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
@@ -63,4 +74,5 @@ pub enum DataKey {
     EngineerHistory(Address),
     EngineerAuth(u64, Address),
     Timelock(Symbol),
+    HealthSnapshots(u64),
 }
