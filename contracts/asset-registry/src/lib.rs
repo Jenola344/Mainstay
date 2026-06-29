@@ -3,7 +3,7 @@ use shared::validation::{require_non_empty_vec, require_string_length};
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, panic_with_error, symbol_short,
-    Address, BytesN, Env, String, Symbol, Vec,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 #[contracterror]
@@ -78,6 +78,15 @@ pub enum AssetStatus {
     Active = 0,
     Decommissioned = 1,
     UnderMaintenance = 2,
+}
+
+/// Storage key enum for indexed lookups.
+#[contracttype]
+pub enum DataKey {
+    /// Maps a keyword category (arbitrary bytes) to the list of asset IDs tagged with it.
+    AssetsByCategory(Bytes),
+    /// Maps an owner address to the list of asset IDs they own.
+    AssetsByOwner(Address),
 }
 
 const ASSET_COUNT: Symbol = symbol_short!("A_COUNT");
@@ -168,8 +177,8 @@ fn serial_dedup_key(hash: &BytesN<32>) -> (Symbol, BytesN<32>) {
 }
 
 /// Owner index key: owner → Vec<u64> of asset IDs.
-fn owner_index_key(owner: &Address) -> (Symbol, Address) {
-    (symbol_short!("OWN_IDX"), owner.clone())
+fn owner_index_key(owner: &Address) -> DataKey {
+    DataKey::AssetsByOwner(owner.clone())
 }
 
 /// Asset type allowlist key: asset_type → bool.
@@ -282,6 +291,79 @@ fn owner_index_remove(env: &Env, owner: &Address, asset_id: u64) {
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+}
+
+/// Category index key: category bytes → Vec<u64> of asset IDs.
+fn category_assets_key(category: &Bytes) -> DataKey {
+    DataKey::AssetsByCategory(category.clone())
+}
+
+/// Reverse index key: asset_id → Vec<Bytes> of categories the asset belongs to.
+fn asset_categories_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("AST_CATS"), asset_id)
+}
+
+fn category_assets_add(env: &Env, category: &Bytes, asset_id: u64) {
+    let key = category_assets_key(category);
+    let mut ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    ids.push_back(asset_id);
+    env.storage().persistent().set(&key, &ids);
+    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+}
+
+fn category_assets_remove(env: &Env, category: &Bytes, asset_id: u64) {
+    let key = category_assets_key(category);
+    let ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    let mut updated: Vec<u64> = Vec::new(env);
+    for id in ids.iter() {
+        if id != asset_id {
+            updated.push_back(id);
+        }
+    }
+    if updated.is_empty() {
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, &updated);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    }
+}
+
+fn asset_categories_add(env: &Env, asset_id: u64, category: &Bytes) {
+    let key = asset_categories_key(asset_id);
+    let mut cats: Vec<Bytes> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    for existing in cats.iter() {
+        if existing == *category {
+            return;
+        }
+    }
+    cats.push_back(category.clone());
+    env.storage().persistent().set(&key, &cats);
+    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+}
+
+fn asset_categories_remove_all(env: &Env, asset_id: u64) {
+    let key = asset_categories_key(asset_id);
+    let cats: Vec<Bytes> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    for cat in cats.iter() {
+        category_assets_remove(env, &cat, asset_id);
+    }
+    env.storage().persistent().remove(&key);
 }
 
 fn is_paused(env: &Env) -> bool {
@@ -827,6 +909,64 @@ impl AssetRegistry {
         AssetTypePage { assets, total }
     }
 
+    /// Returns all asset IDs tagged with the given category keyword.
+    ///
+    /// Categories are arbitrary byte strings (e.g. manufacturer name, geographic region)
+    /// assigned to assets via [`set_asset_category`]. An empty vec is returned when no
+    /// assets have been tagged with the given category.
+    pub fn get_assets_by_category(env: Env, category: Bytes) -> Vec<u64> {
+        let key = category_assets_key(&category);
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        }
+        ids
+    }
+
+    /// Tag an asset with a keyword category for later retrieval via [`get_assets_by_category`].
+    ///
+    /// Only the asset owner or the contract admin may tag an asset. Tagging an asset with
+    /// a category it already has is a no-op. A single asset may carry multiple categories.
+    ///
+    /// # Arguments
+    /// * `caller` - The address initiating the tag (owner or admin)
+    /// * `asset_id` - The unique identifier of the asset to tag
+    /// * `category` - Arbitrary byte keyword (e.g. `b"Caterpillar"`, `b"NorthAmerica"`)
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::UnauthorizedOwner`] if caller is neither owner nor admin
+    pub fn set_asset_category(env: Env, caller: Address, asset_id: u64, category: Bytes) {
+        ensure_not_paused(&env);
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        let admin = Self::get_admin(env.clone());
+        if caller == admin {
+            admin.require_auth();
+        } else if caller == asset.owner {
+            asset.owner.require_auth();
+        } else {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        asset_categories_add(&env, asset_id, &category);
+        category_assets_add(&env, &category, asset_id);
+
+        env.events().publish(
+            (symbol_short!("TAG_ASSET"), asset_id),
+            (caller, category),
+        );
+    }
+
     /// Initialize the admin address for the contract.
     /// This function should be called once immediately after deployment.
     ///
@@ -1040,6 +1180,9 @@ impl AssetRegistry {
 
         // Remove from type-to-assets index
         type_assets_remove(&env, &asset.asset_type, asset_id);
+
+        // Remove from all category indexes
+        asset_categories_remove_all(&env, asset_id);
 
         // Emit deregistration event
         env.events().publish(
@@ -4813,5 +4956,202 @@ mod tests {
             score_after, score_at_decommission,
             "lifecycle score must not decay after decommission_asset_notify"
         );
+    }
+
+    // --- Issue #874: Asset Categorization and Indexing ---
+
+    #[test]
+    fn test_get_assets_by_category_returns_tagged_ids() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+
+        let owner = Address::generate(&env);
+        let cat = Bytes::from_slice(&env, b"Caterpillar");
+
+        let id1 = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "CAT 3516"), &owner);
+        let id2 = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "CAT 3512"), &owner);
+        let id3 = reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "GE LM2500"), &owner);
+
+        client.set_asset_category(&owner, &id1, &cat);
+        client.set_asset_category(&owner, &id2, &cat);
+
+        let ids = client.get_assets_by_category(&cat);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&id1));
+        assert!(ids.contains(&id2));
+        assert!(!ids.contains(&id3));
+    }
+
+    #[test]
+    fn test_get_assets_by_category_returns_empty_for_unknown_category() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let unknown_cat = Bytes::from_slice(&env, b"NonExistent");
+        let ids = client.get_assets_by_category(&unknown_cat);
+        assert_eq!(ids.len(), 0);
+    }
+
+    #[test]
+    fn test_asset_can_belong_to_multiple_categories() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "CAT 3516"), &owner);
+
+        let cat_mfr = Bytes::from_slice(&env, b"Caterpillar");
+        let cat_region = Bytes::from_slice(&env, b"NorthAmerica");
+
+        client.set_asset_category(&owner, &id, &cat_mfr);
+        client.set_asset_category(&owner, &id, &cat_region);
+
+        assert!(client.get_assets_by_category(&cat_mfr).contains(&id));
+        assert!(client.get_assets_by_category(&cat_region).contains(&id));
+    }
+
+    #[test]
+    fn test_set_asset_category_is_idempotent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "CAT 3516"), &owner);
+        let cat = Bytes::from_slice(&env, b"Caterpillar");
+
+        client.set_asset_category(&owner, &id, &cat);
+        client.set_asset_category(&owner, &id, &cat);
+
+        assert_eq!(client.get_assets_by_category(&cat).len(), 1);
+    }
+
+    #[test]
+    fn test_get_assets_by_category_cleaned_up_after_deregister() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id1 = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "CAT 3516"), &owner);
+        let id2 = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "CAT 3512"), &owner);
+        let cat = Bytes::from_slice(&env, b"Caterpillar");
+
+        client.set_asset_category(&owner, &id1, &cat);
+        client.set_asset_category(&owner, &id2, &cat);
+        assert_eq!(client.get_assets_by_category(&cat).len(), 2);
+
+        client.deregister_asset(&owner, &id1);
+
+        let remaining = client.get_assets_by_category(&cat);
+        assert_eq!(remaining.len(), 1);
+        assert!(!remaining.contains(&id1));
+        assert!(remaining.contains(&id2));
+    }
+
+    #[test]
+    fn test_non_owner_cannot_set_asset_category() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "CAT 3516"), &owner);
+        let cat = Bytes::from_slice(&env, b"Caterpillar");
+
+        let result = client.try_set_asset_category(&stranger, &id, &cat);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedOwner as u32
+            )))
+        );
+        assert_eq!(client.get_assets_by_category(&cat).len(), 0);
+    }
+
+    #[test]
+    fn test_get_assets_by_owner_with_multiple_assets_multiple_owners() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+
+        let a1 = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Alpha 1"), &owner_a);
+        let a2 = reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Alpha 2"), &owner_a);
+        let b1 = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Beta 1"), &owner_b);
+
+        let ids_a = client.get_assets_by_owner(&owner_a);
+        assert_eq!(ids_a.len(), 2);
+        assert!(ids_a.contains(&a1));
+        assert!(ids_a.contains(&a2));
+        assert!(!ids_a.contains(&b1));
+
+        let ids_b = client.get_assets_by_owner(&owner_b);
+        assert_eq!(ids_b.len(), 1);
+        assert!(ids_b.contains(&b1));
+    }
+
+    #[test]
+    fn test_get_assets_by_owner_uses_datakey_owner_variant() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Asset X"), &owner);
+
+        env.as_contract(&contract_id, || {
+            let key = DataKey::AssetsByOwner(owner.clone());
+            let stored: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(&env));
+            assert!(stored.contains(&id));
+        });
     }
 }
