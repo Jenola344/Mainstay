@@ -3,7 +3,7 @@ use shared::validation::{require_non_empty_vec, require_string_length};
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, panic_with_error, symbol_short,
-    Address, BytesN, Env, String, Symbol, Vec,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 #[contracterror]
@@ -104,6 +104,15 @@ pub enum AssetStatus {
     UnderMaintenance = 2,
 }
 
+/// Storage key enum for indexed lookups.
+#[contracttype]
+pub enum DataKey {
+    /// Maps a keyword category (arbitrary bytes) to the list of asset IDs tagged with it.
+    AssetsByCategory(Bytes),
+    /// Maps an owner address to the list of asset IDs they own.
+    AssetsByOwner(Address),
+}
+
 const ASSET_COUNT: Symbol = symbol_short!("A_COUNT");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
@@ -195,8 +204,8 @@ fn serial_dedup_key(hash: &BytesN<32>) -> (Symbol, BytesN<32>) {
 }
 
 /// Owner index key: owner → Vec<u64> of asset IDs.
-fn owner_index_key(owner: &Address) -> (Symbol, Address) {
-    (symbol_short!("OWN_IDX"), owner.clone())
+fn owner_index_key(owner: &Address) -> DataKey {
+    DataKey::AssetsByOwner(owner.clone())
 }
 
 /// Asset type allowlist key: asset_type → bool.
@@ -309,6 +318,79 @@ fn owner_index_remove(env: &Env, owner: &Address, asset_id: u64) {
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+}
+
+/// Category index key: category bytes → Vec<u64> of asset IDs.
+fn category_assets_key(category: &Bytes) -> DataKey {
+    DataKey::AssetsByCategory(category.clone())
+}
+
+/// Reverse index key: asset_id → Vec<Bytes> of categories the asset belongs to.
+fn asset_categories_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("AST_CATS"), asset_id)
+}
+
+fn category_assets_add(env: &Env, category: &Bytes, asset_id: u64) {
+    let key = category_assets_key(category);
+    let mut ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    ids.push_back(asset_id);
+    env.storage().persistent().set(&key, &ids);
+    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+}
+
+fn category_assets_remove(env: &Env, category: &Bytes, asset_id: u64) {
+    let key = category_assets_key(category);
+    let ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    let mut updated: Vec<u64> = Vec::new(env);
+    for id in ids.iter() {
+        if id != asset_id {
+            updated.push_back(id);
+        }
+    }
+    if updated.is_empty() {
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, &updated);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    }
+}
+
+fn asset_categories_add(env: &Env, asset_id: u64, category: &Bytes) {
+    let key = asset_categories_key(asset_id);
+    let mut cats: Vec<Bytes> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    for existing in cats.iter() {
+        if existing == *category {
+            return;
+        }
+    }
+    cats.push_back(category.clone());
+    env.storage().persistent().set(&key, &cats);
+    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+}
+
+fn asset_categories_remove_all(env: &Env, asset_id: u64) {
+    let key = asset_categories_key(asset_id);
+    let cats: Vec<Bytes> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    for cat in cats.iter() {
+        category_assets_remove(env, &cat, asset_id);
+    }
+    env.storage().persistent().remove(&key);
 }
 
 fn is_paused(env: &Env) -> bool {
@@ -907,6 +989,64 @@ impl AssetRegistry {
         AssetTypePage { assets, total }
     }
 
+    /// Returns all asset IDs tagged with the given category keyword.
+    ///
+    /// Categories are arbitrary byte strings (e.g. manufacturer name, geographic region)
+    /// assigned to assets via [`set_asset_category`]. An empty vec is returned when no
+    /// assets have been tagged with the given category.
+    pub fn get_assets_by_category(env: Env, category: Bytes) -> Vec<u64> {
+        let key = category_assets_key(&category);
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        }
+        ids
+    }
+
+    /// Tag an asset with a keyword category for later retrieval via [`get_assets_by_category`].
+    ///
+    /// Only the asset owner or the contract admin may tag an asset. Tagging an asset with
+    /// a category it already has is a no-op. A single asset may carry multiple categories.
+    ///
+    /// # Arguments
+    /// * `caller` - The address initiating the tag (owner or admin)
+    /// * `asset_id` - The unique identifier of the asset to tag
+    /// * `category` - Arbitrary byte keyword (e.g. `b"Caterpillar"`, `b"NorthAmerica"`)
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::UnauthorizedOwner`] if caller is neither owner nor admin
+    pub fn set_asset_category(env: Env, caller: Address, asset_id: u64, category: Bytes) {
+        ensure_not_paused(&env);
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        let admin = Self::get_admin(env.clone());
+        if caller == admin {
+            admin.require_auth();
+        } else if caller == asset.owner {
+            asset.owner.require_auth();
+        } else {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        asset_categories_add(&env, asset_id, &category);
+        category_assets_add(&env, &category, asset_id);
+
+        env.events().publish(
+            (symbol_short!("TAG_ASSET"), asset_id),
+            (caller, category),
+        );
+    }
+
     /// Initialize the admin address for the contract.
     /// This function should be called once immediately after deployment.
     ///
@@ -1120,6 +1260,9 @@ impl AssetRegistry {
 
         // Remove from type-to-assets index
         type_assets_remove(&env, &asset.asset_type, asset_id);
+
+        // Remove from all category indexes
+        asset_categories_remove_all(&env, asset_id);
 
         // Emit deregistration event
         env.events().publish(
