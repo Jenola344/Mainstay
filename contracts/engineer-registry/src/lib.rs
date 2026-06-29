@@ -416,8 +416,6 @@ impl EngineerRegistry {
         if !record.active {
             panic_with_error!(&env, ContractError::CredentialAlreadyRevoked);
         }
-        let credential_hash = record.credential_hash.clone();
-        let revoked_by = record.issuer.clone();
         // Extend TTL before write to ensure consistency even on near-expired entries
         env.storage()
             .persistent()
@@ -433,7 +431,7 @@ impl EngineerRegistry {
             (symbol_short!("ADM_AUD"), symbol_short!("REV_CRED")),
             (
                 record.issuer.clone(),
-                env.ledger().timestamp(),
+                timestamp,
                 engineer.clone(),
             ),
         );
@@ -443,7 +441,7 @@ impl EngineerRegistry {
                 engineer.clone(),
                 record.credential_hash.clone(),
                 record.issuer.clone(),
-                env.ledger().timestamp(),
+                timestamp,
             ),
         );
     }
