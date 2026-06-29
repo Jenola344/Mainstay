@@ -26,6 +26,7 @@ pub enum ContractError {
     TimelockNotExpired = 15,
     ProposalNotFound = 16,
     BatchRevokeTooLarge = 17,
+    CredentialExpired = 18,
 }
 
 #[contracttype]
@@ -454,19 +455,20 @@ impl EngineerRegistry {
     /// ## Renewal semantics
     ///
     /// The new `expires_at` is calculated as:
-    /// - **Not yet expired**: `current expires_at + new_validity_period`
+    /// - **Not yet expired or in grace period**: `current expires_at + new_validity_period`
     ///   (remaining validity is preserved; the new period is stacked on top)
-    /// - **Already expired**: `now + new_validity_period`
-    ///   (credential is reactivated from the current ledger timestamp)
+    /// - **Hard-expired**: Renewal is rejected; re-issuance is required
+    /// - **Revoked**: Renewal is rejected
     ///
     /// # Arguments
     /// * `engineer` - The address of the engineer whose credential should be renewed
     /// * `new_validity_period` - Duration in seconds to add to the credential's expiry
-    ///   (stacked on top of remaining validity when called before expiry)
+    ///   (stacked on top of remaining validity when not hard-expired)
     ///
     /// # Panics
     /// - [`ContractError::EngineerNotFound`] if no engineer exists with the given address
     /// - [`ContractError::CredentialRevoked`] if the credential has been revoked
+    /// - [`ContractError::CredentialExpired`] if the credential is hard-expired (re-issuance required)
     /// - [`ContractError::IssuerRemoved`] if the issuer is no longer trusted
     /// - [`ContractError::InvalidValidityPeriod`] if `new_validity_period` is below the minimum
     pub fn renew_credential(env: Env, engineer: Address, new_validity_period: u64) {
@@ -482,6 +484,16 @@ impl EngineerRegistry {
         }
         if !record.active {
             panic_with_error!(&env, ContractError::CredentialRevoked);
+        }
+        // Check if credential is hard-expired; renewal requires re-issuance
+        let grace_period: u64 = env
+            .storage()
+            .persistent()
+            .get(&GRACE_PERIOD_KEY)
+            .unwrap_or(DEFAULT_GRACE_PERIOD_SECS);
+        let now = env.ledger().timestamp();
+        if now >= record.expires_at + grace_period {
+            panic_with_error!(&env, ContractError::CredentialExpired);
         }
         if new_validity_period < MIN_VALIDITY_PERIOD {
             panic_with_error!(&env, ContractError::InvalidValidityPeriod);
@@ -3439,7 +3451,40 @@ mod tests {
     }
 
     #[test]
-    fn test_get_grace_period_returns_default() {
+    fn test_renew_credential_hard_expired_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        let base_time = env.ledger().timestamp();
+        // Register engineer with 1 day validity
+        client.register_engineer(&engineer, &hash, &issuer, &86_400, &None);
+
+        // Advance beyond grace period (default 7 days = 604_800 seconds)
+        // Expiry: base_time + 86_400
+        // Grace period end: base_time + 86_400 + 604_800 = base_time + 691_200
+        env.ledger().set_timestamp(base_time + 691_201);
+
+        // Verify credential is hard-expired
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::HardExpired
+        );
+
+        // Attempt to renew hard-expired credential should fail
+        let result = client.try_renew_credential(&engineer, &86_400);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::CredentialExpired as u32
+            ))),
+        );
+    }
         let env = Env::default();
         env.mock_all_auths();
         let (client, _admin) = setup(&env);
