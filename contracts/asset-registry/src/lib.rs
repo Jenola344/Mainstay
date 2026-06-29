@@ -30,6 +30,12 @@ pub enum ContractError {
     /// A new proposal cannot overwrite it; wait for the timelock to expire and execute,
     /// or allow the existing proposal to lapse before re-proposing.
     ProposalAlreadyExists = 16,
+    /// An unexpired ownership transfer is already pending for this asset.
+    TransferAlreadyPending = 17,
+    /// No pending ownership transfer exists for this asset.
+    NoPendingTransfer = 18,
+    /// The acceptance window for a pending ownership transfer has elapsed.
+    TransferExpired = 19,
 }
 
 #[contracttype]
@@ -72,6 +78,14 @@ pub struct TimelockProposal {
     pub executed: bool,
 }
 
+/// A pending multi-signature ownership transfer awaiting acceptance by `new_owner`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTransfer {
+    pub new_owner: Address,
+    pub initiated_at: u64,
+}
+
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum AssetStatus {
@@ -83,6 +97,8 @@ pub enum AssetStatus {
 const ASSET_COUNT: Symbol = symbol_short!("A_COUNT");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
+/// Default window for a proposed new owner to accept an ownership transfer.
+const TRANSFER_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const ASSET_TYPE_PREFIX: Symbol = symbol_short!("AST_TYPE");
@@ -99,6 +115,10 @@ pub const RM_TYPE_TOPIC: Symbol = symbol_short!("RM_TYPE");
 
 fn asset_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("ASSET"), id)
+}
+
+fn pending_transfer_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("OWN_XFER"), asset_id)
 }
 
 fn timelock_key(op: Symbol, asset_id: u64) -> (Symbol, Symbol, u64) {
@@ -1176,6 +1196,127 @@ impl AssetRegistry {
         );
     }
 
+    /// Initiate a multi-signature ownership transfer (step 1 of 2).
+    /// Only the current owner can initiate. The proposed `new_owner` has
+    /// `TRANSFER_TIMEOUT_SECS` (7 days) to accept via [`Self::accept_ownership_transfer`]
+    /// before the proposal expires.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset to transfer
+    /// * `new_owner` - The address proposed as the new owner
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    /// - [`ContractError::SameOwner`] if `new_owner` is already the current owner
+    /// - [`ContractError::TransferAlreadyPending`] if an unexpired transfer is already pending
+    pub fn initiate_ownership_transfer(env: Env, asset_id: u64, new_owner: Address) {
+        ensure_not_paused(&env);
+
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        asset.owner.require_auth();
+
+        if asset.owner == new_owner {
+            panic_with_error!(&env, ContractError::SameOwner);
+        }
+
+        let key = pending_transfer_key(asset_id);
+        if let Some(existing) = env.storage().persistent().get::<_, PendingTransfer>(&key) {
+            if env.ledger().timestamp().saturating_sub(existing.initiated_at) < TRANSFER_TIMEOUT_SECS {
+                panic_with_error!(&env, ContractError::TransferAlreadyPending);
+            }
+        }
+
+        let pending = PendingTransfer {
+            new_owner: new_owner.clone(),
+            initiated_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&key, &pending);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("OWN_INIT"), asset_id),
+            (asset.owner, new_owner, env.ledger().timestamp()),
+        );
+    }
+
+    /// Accept a pending ownership transfer (step 2 of 2). Only the proposed new owner
+    /// can accept, and only within `TRANSFER_TIMEOUT_SECS` (7 days) of initiation.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset whose transfer is being accepted
+    ///
+    /// # Panics
+    /// - [`ContractError::NoPendingTransfer`] if no transfer is pending for this asset
+    /// - [`ContractError::TransferExpired`] if the acceptance window has elapsed
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn accept_ownership_transfer(env: Env, asset_id: u64) {
+        ensure_not_paused(&env);
+
+        let key = pending_transfer_key(asset_id);
+        let pending: PendingTransfer = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoPendingTransfer));
+
+        if env.ledger().timestamp().saturating_sub(pending.initiated_at) >= TRANSFER_TIMEOUT_SECS {
+            env.storage().persistent().remove(&key);
+            panic_with_error!(&env, ContractError::TransferExpired);
+        }
+
+        pending.new_owner.require_auth();
+
+        let mut asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        let current_owner = asset.owner.clone();
+        let new_owner = pending.new_owner.clone();
+
+        // Move dedup key to new owner
+        let hash: BytesN<32> = env
+            .crypto()
+            .sha256(&asset.metadata.clone().to_xdr(&env))
+            .into();
+        env.storage()
+            .persistent()
+            .remove(&dedup_key(&current_owner, &asset.asset_type, &hash));
+        env.storage()
+            .persistent()
+            .set(&dedup_key(&new_owner, &asset.asset_type, &hash), &asset_id);
+        env.storage().persistent().extend_ttl(
+            &dedup_key(&new_owner, &asset.asset_type, &hash),
+            TTL_THRESHOLD,
+            TTL_TARGET,
+        );
+
+        // Move owner index entry
+        owner_index_remove(&env, &current_owner, asset_id);
+        owner_index_add(&env, &new_owner, asset_id);
+
+        asset.owner = new_owner.clone();
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+        env.storage()
+            .persistent()
+            .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+
+        env.storage().persistent().remove(&key);
+
+        env.events().publish(
+            (symbol_short!("OWN_DONE"), asset_id),
+            (current_owner, new_owner, env.ledger().timestamp()),
+        );
+    }
+
     /// Admin-only function to decommission an asset.
     /// Sets the decommissioned flag and resets the collateral score to 0.
     ///
@@ -2214,6 +2355,214 @@ mod tests {
 
         // env.events().all() reflects only the most recent contract call
         assert_eq!(env.events().all().len(), 1);
+    }
+
+    #[test]
+    fn test_ownership_transfer_initiate_and_accept() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+        // Ownership has not changed yet — it only changes on acceptance.
+        assert_eq!(client.get_asset(&id).owner, owner);
+
+        client.accept_ownership_transfer(&id);
+        assert_eq!(client.get_asset(&id).owner, new_owner);
+    }
+
+    #[test]
+    fn test_ownership_transfer_emits_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+        assert_eq!(env.events().all().len(), 1);
+
+        client.accept_ownership_transfer(&id);
+        assert_eq!(env.events().all().len(), 1);
+    }
+
+    #[test]
+    fn test_ownership_transfer_same_owner_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let result = client.try_initiate_ownership_transfer(&id, &owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::SameOwner as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_ownership_transfer_already_pending_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let other_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+        let result = client.try_initiate_ownership_transfer(&id, &other_owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TransferAlreadyPending as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_ownership_transfer_accept_without_pending_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let result = client.try_accept_ownership_transfer(&id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NoPendingTransfer as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_ownership_transfer_timeout_expires() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+
+        // Advance the ledger past the 7-day acceptance window.
+        env.ledger()
+            .with_mut(|li| li.timestamp += TRANSFER_TIMEOUT_SECS);
+
+        let result = client.try_accept_ownership_transfer(&id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TransferExpired as u32,
+            ))),
+        );
+
+        // Ownership is unchanged after expiry.
+        assert_eq!(client.get_asset(&id).owner, owner);
+
+        // A new transfer can be initiated after the old one expired.
+        client.initiate_ownership_transfer(&id, &new_owner);
+        client.accept_ownership_transfer(&id);
+        assert_eq!(client.get_asset(&id).owner, new_owner);
+    }
+
+    #[test]
+    fn test_ownership_transfer_updates_dedup_so_old_owner_can_reregister() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "CAT-3516");
+
+        let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+        client.initiate_ownership_transfer(&id, &new_owner);
+        client.accept_ownership_transfer(&id);
+
+        let id2 = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+        assert_ne!(id, id2);
     }
 
     #[test]
