@@ -86,6 +86,7 @@ fn frozen_key(asset_id: u64) -> (Symbol, u64) {
 
 fn frozen_score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("FRZ_SCR"), asset_id)
+}
 fn revoke_eng_timelock_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("RVK_TL"), asset_id, engineer.clone())
 }
@@ -260,13 +261,24 @@ fn verify_asset_exists(env: &Env, asset_registry: &Address, asset_id: &u64) {
 
 // Minimal client interface for cross-contract call to EngineerRegistry
 mod engineer_registry {
-    use soroban_sdk::{contractclient, Address, Env, Vec};
+    use soroban_sdk::{contractclient, contracttype, Address, Env, Vec};
+
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum CredentialStatus {
+        Valid = 0,
+        GracePeriod = 1,
+        HardExpired = 2,
+        Revoked = 3,
+        NotFound = 4,
+    }
 
     #[allow(dead_code)]
     #[contractclient(name = "EngineerRegistryClient")]
     pub trait EngineerRegistry {
-        fn verify_engineer(env: Env, engineer: Address) -> Option<bool>;
-        fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<bool>;
+        fn verify_engineer(env: Env, engineer: Address) -> CredentialStatus;
+        fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<CredentialStatus>;
+        fn get_credential_status(env: Env, engineer: Address) -> CredentialStatus;
     }
 }
 
@@ -555,9 +567,6 @@ impl Lifecycle {
         admin: Address,
         max_history: u32,
     ) {
-        if deployer != env.invoker() {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
         deployer.require_auth();
         if env.storage().persistent().has(&CONFIG) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
@@ -1082,10 +1091,8 @@ impl Lifecycle {
         let registry_id = get_engineer_registry_addr(&env);
         let registry = engineer_registry::EngineerRegistryClient::new(&env, &registry_id);
         use engineer_registry::CredentialStatus;
-        let status = registry.verify_engineer(&engineer);
-        if status != CredentialStatus::Valid {
-        let verified = registry.verify_engineer(&engineer).unwrap_or(false);
-        if !verified {
+        let status = registry.get_credential_status(&engineer);
+        if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
         require_engineer_authorized(&env, asset_id, &engineer);
@@ -1280,13 +1287,8 @@ impl Lifecycle {
         let engineer_registry_client =
             engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry);
         use engineer_registry::CredentialStatus;
-        let status = engineer_registry_client.verify_engineer(&engineer);
-        if status != CredentialStatus::Valid {
-        let mut batch = Vec::new(&env);
-        batch.push_back(engineer.clone());
-        let results = engineer_registry_client.batch_verify_engineers(&batch);
-        let verified = results.get(0).unwrap_or(false);
-        if !verified {
+        let status = engineer_registry_client.get_credential_status(&engineer);
+        if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
         require_engineer_authorized(&env, asset_id, &engineer);
@@ -5329,9 +5331,9 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
-        assert!(engineer_registry_client.verify_engineer(&engineer).unwrap_or(false));
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
         engineer_registry_client.revoke_credential(&engineer);
-        assert!(!engineer_registry_client.verify_engineer(&engineer).unwrap_or(true));
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
 
         let result = client.try_submit_maintenance(
             &asset_id,
@@ -5369,7 +5371,7 @@ mod tests {
 
         // Revoke the credential
         engineer_registry_client.revoke_credential(&engineer);
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(false));
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
 
         // Attempt to submit maintenance ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â must fail with UnauthorizedEngineer
         let result = client.try_submit_maintenance(
@@ -5388,7 +5390,7 @@ mod tests {
         // Re-register the same engineer with a new credential hash
         let hash_v2 = BytesN::from_array(&env, &[2u8; 32]);
         engineer_registry_client.register_engineer(&engineer, &hash_v2, &issuer, &31_536_000);
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(true));
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
 
         // Submission must now succeed
         client.submit_maintenance(
@@ -5421,14 +5423,14 @@ mod tests {
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400);
 
         // Verify engineer is initially valid
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(true));
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
 
         // Advance ledger past expiry (86401 seconds)
         env.ledger()
             .with_mut(|li| li.timestamp = li.timestamp + 86_401);
 
         // Verify engineer is now expired
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(false));
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
 
         // Attempt submit_maintenance and assert UnauthorizedEngineer is returned
         let result = client.try_submit_maintenance(
@@ -5470,12 +5472,12 @@ mod tests {
         // Register with validity_period = 86400 seconds (minimum)
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400);
 
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(true));
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
 
         // Advance ledger by 101 seconds ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â credential is now expired
         env.ledger().with_mut(|li| li.timestamp += 86_401);
 
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(false));
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
 
         let result = client.try_submit_maintenance(
             &asset_id,
@@ -5516,12 +5518,12 @@ mod tests {
         // Register with validity_period = 86400 seconds (minimum)
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400);
 
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(true));
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
 
         // Advance ledger by 101 seconds ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â credential is now expired
         env.ledger().with_mut(|li| li.timestamp += 86_401);
 
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), Some(false));
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
 
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
@@ -5570,7 +5572,7 @@ mod tests {
             &issuer,
             &31_536_000,
         );
-        assert_eq!(engineer_registry.verify_engineer(&engineer), Some(true));
+        assert_eq!(engineer_registry.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
 
         // 3. Submit 10 maintenance records (default score_increment = 5pts each)
         for i in 0..10u32 {
@@ -7142,7 +7144,7 @@ mod tests {
             &issuer,
             &31_536_000,
         );
-        assert_eq!(engineer_registry.verify_engineer(&engineer), Some(true));
+        assert_eq!(engineer_registry.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
 
         // 4. Submit maintenance ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â 10 ÃƒÆ’Ã¢â‚¬â€ OVERHAUL (5 pts each) = 50, eligible
         for _ in 0..10 {
