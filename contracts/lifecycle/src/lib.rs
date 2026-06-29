@@ -2894,6 +2894,64 @@ mod tests {
     }
 
     #[test]
+    fn test_submit_maintenance_rejects_empty_notes() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let empty_notes = String::from_str(&env, "");
+
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &empty_notes,
+            &engineer,
+        );
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NotesTooLong as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_submit_maintenance_rejects_decommissioned_asset() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Decommission the asset
+        let admin = Address::generate(&env);
+        asset_registry_client.initialize_admin(&admin, &admin);
+        asset_registry_client.decommission_asset(&admin, &asset_id);
+
+        // Attempt to submit maintenance for decommissioned asset should fail
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Should be rejected"),
+            &engineer,
+        );
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32,
+            ))),
+        );
+    }
+
+    #[test]
     fn test_unregistered_engineer_rejected() {
         let env = Env::default();
         env.mock_all_auths();
