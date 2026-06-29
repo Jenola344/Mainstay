@@ -39,6 +39,8 @@ pub enum ContractError {
     TooManyVouchers = 14,
     /// Voucher withdrawal not allowed.
     VouchWithdrawNotAllowed = 15,
+    /// Caller is not the authorized borrower for this loan.
+    UnauthorizedBorrower = 16,
 }
 
 #[contracttype]
@@ -298,7 +300,9 @@ impl LendingContract {
         }
 
         // #645: Verify the caller matches the loan's borrower.
-        assert_eq!(borrower, loan.borrower);
+        if borrower != loan.borrower {
+            panic_with_error!(&env, ContractError::UnauthorizedBorrower);
+        }
 
         let vouches: Vec<Vouch> = env
             .storage()
@@ -452,9 +456,6 @@ impl LendingContract {
     /// Enforces max_vouchers_per_loan cap to prevent gas exhaustion (#633).
     pub fn slash(env: Env, admin: Address, borrower: Address) {
         require_admin(&env, &admin);
-
-        // #646: Guard against misconfigured SLASH_BPS exceeding 10_000.
-        assert!(SLASH_BPS <= 10_000);
 
         let key = loan_key(&borrower);
         let mut loan: Loan = env

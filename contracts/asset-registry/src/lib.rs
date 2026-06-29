@@ -312,12 +312,10 @@ fn owner_index_remove(env: &Env, owner: &Address, asset_id: u64) {
         env.storage().persistent().remove(&key);
     } else {
         env.storage().persistent().set(&key, &updated);
-        env.storage().persistent().extend_ttl(&key, 518400, 518400);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
     }
-    env.storage().persistent().set(&key, &updated);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 /// Category index key: category bytes → Vec<u64> of asset IDs.

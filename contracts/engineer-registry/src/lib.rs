@@ -82,12 +82,10 @@ const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
 const MIN_VALIDITY_PERIOD: u64 = 86_400;
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
-/// Default grace period allowing engineers to work after credential expiry (7 days).
-const DEFAULT_GRACE_PERIOD_SECS: u64 = 7 * 86_400;
-const GRACE_PERIOD_KEY: Symbol = symbol_short!("GRACE_P");
-const MAX_BATCH_REVOKE: u32 = 50;
 /// Grace period allowing engineers to work after credential expiry (7 days).
 const GRACE_PERIOD_SECS: u64 = 7 * 86_400;
+const GRACE_PERIOD_KEY: Symbol = symbol_short!("GRACE_P");
+const MAX_BATCH_REVOKE: u32 = 50;
 
 /// Soroban persistent-storage TTL constants.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
