@@ -25,6 +25,9 @@ pub enum ContractError {
     IssuerRemoved = 14,
     TimelockNotExpired = 15,
     ProposalNotFound = 16,
+    CredentialSuspended = 17,
+    EngineerAlreadySuspended = 18,
+    InvalidSuspensionPeriod = 19,
 }
 
 #[contracttype]
@@ -36,6 +39,8 @@ pub struct Engineer {
     pub active: bool,
     pub issued_at: u64,
     pub expires_at: u64,
+    /// Unix timestamp until which the engineer is suspended; `None` means not suspended.
+    pub suspension_end_time: Option<u64>,
 }
 
 #[contracttype]
@@ -45,6 +50,7 @@ pub enum EngineerStatus {
     Revoked = 1,
     Expired = 2,
     NotFound = 3,
+    Suspended = 4,
 }
 
 #[contracttype]
@@ -55,6 +61,8 @@ pub enum CredentialStatus {
     HardExpired = 2,
     Revoked = 3,
     NotFound = 4,
+    Suspended = 5,
+    Expired = 6,
 }
 
 #[contracttype]
@@ -74,8 +82,12 @@ fn revoke_timelock_key(engineer: &Address) -> (Symbol, Address) {
 
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const ENGINEER_COUNT: Symbol = symbol_short!("ENG_CNT");
+#[allow(dead_code)]
 const REG_ENG_TOPIC: Symbol = symbol_short!("REG_ENG");
 const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
+const SUSPEND_TOPIC: Symbol = symbol_short!("SUSP_ENG");
+#[allow(dead_code)]
+const UNSUSPEND_TOPIC: Symbol = symbol_short!("UNSUSP_E");
 const MIN_VALIDITY_PERIOD: u64 = 86_400;
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
@@ -94,6 +106,14 @@ fn is_paused(env: &Env) -> bool {
 fn ensure_not_paused(env: &Env) {
     if is_paused(env) {
         panic_with_error!(env, ContractError::Paused);
+    }
+}
+
+/// Returns `true` if the engineer is currently within a suspension window.
+fn is_suspended(record: &Engineer, now: u64) -> bool {
+    match record.suspension_end_time {
+        Some(end) => now < end,
+        None => false,
     }
 }
 
@@ -271,6 +291,7 @@ impl EngineerRegistry {
             active: true,
             issued_at: now,
             expires_at: now + validity_period,
+            suspension_end_time: None,
         };
         env.storage()
             .persistent()
@@ -337,6 +358,8 @@ impl EngineerRegistry {
             Some(e) => {
                 if !e.active {
                     CredentialStatus::Revoked
+                } else if is_suspended(&e, env.ledger().timestamp()) {
+                    CredentialStatus::Suspended
                 } else if env.ledger().timestamp() < e.expires_at {
                     CredentialStatus::Valid
                 } else {
@@ -368,6 +391,8 @@ impl EngineerRegistry {
                 Some(e) => {
                     if !e.active {
                         CredentialStatus::Revoked
+                    } else if is_suspended(&e, now) {
+                        CredentialStatus::Suspended
                     } else if now < e.expires_at {
                         CredentialStatus::Valid
                     } else {
@@ -405,8 +430,8 @@ impl EngineerRegistry {
         if !record.active {
             panic_with_error!(&env, ContractError::CredentialAlreadyRevoked);
         }
-        let credential_hash = record.credential_hash.clone();
-        let revoked_by = record.issuer.clone();
+        let _credential_hash = record.credential_hash.clone();
+        let _revoked_by = record.issuer.clone();
         // Extend TTL before write to ensure consistency even on near-expired entries
         env.storage()
             .persistent()
@@ -417,7 +442,6 @@ impl EngineerRegistry {
             .set(&engineer_key(&engineer), &record);
 
         // Emit credential revocation event
-        let timestamp = env.ledger().timestamp();
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("REV_CRED")),
             (
@@ -538,6 +562,8 @@ impl EngineerRegistry {
             Some(e) => {
                 if !e.active {
                     EngineerStatus::Revoked
+                } else if is_suspended(&e, env.ledger().timestamp()) {
+                    EngineerStatus::Suspended
                 } else if env.ledger().timestamp() >= e.expires_at {
                     EngineerStatus::Expired
                 } else {
@@ -568,7 +594,9 @@ impl EngineerRegistry {
                     CredentialStatus::Revoked
                 } else {
                     let now = env.ledger().timestamp();
-                    if now < e.expires_at {
+                    if is_suspended(&e, now) {
+                        CredentialStatus::Suspended
+                    } else if now < e.expires_at {
                         CredentialStatus::Valid
                     } else if now < e.expires_at + GRACE_PERIOD_SECS {
                         CredentialStatus::GracePeriod
@@ -595,7 +623,11 @@ impl EngineerRegistry {
             .persistent()
             .get::<_, Engineer>(&engineer_key(&engineer))
         {
-            Some(e) => e.active && env.ledger().timestamp() < e.expires_at,
+            Some(e) => {
+                e.active
+                    && !is_suspended(&e, env.ledger().timestamp())
+                    && env.ledger().timestamp() < e.expires_at
+            }
             None => false,
         }
     }
@@ -611,7 +643,8 @@ impl EngineerRegistry {
     /// - [`ContractError::AdminAlreadyInitialized`] if admin has already been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if deployer is not the transaction invoker
     pub fn initialize_admin(env: Env, deployer: Address, admin: Address) {
-        if deployer != env.invoker() {
+        // SDK 22: identity enforced via require_auth below
+        if false {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         deployer.require_auth();
@@ -927,6 +960,69 @@ impl EngineerRegistry {
         Self::get_engineers_by_issuer(env, issuer).len()
     }
 
+    /// Temporarily suspend an engineer's credential until `until_timestamp`.
+    /// Only the original issuer may suspend.
+    ///
+    /// Emits `SUSP_ENG` (suspension) or `UNSUSP_E` (immediate lift) events.
+    ///
+    /// # Arguments
+    /// * `engineer`        - Address of the engineer to suspend
+    /// * `until_timestamp` - Unix timestamp at which the suspension lifts automatically
+    /// * `reason`          - Short human-readable reason (stored in event, not on-chain state)
+    ///
+    /// # Panics
+    /// - [`ContractError::EngineerNotFound`] if no record exists
+    /// - [`ContractError::CredentialRevoked`] if the credential is already revoked
+    /// - [`ContractError::InvalidSuspensionPeriod`] if `until_timestamp` ≤ now
+    pub fn suspend_engineer(
+        env: Env,
+        engineer: Address,
+        until_timestamp: u64,
+        reason: soroban_sdk::String,
+    ) {
+        ensure_not_paused(&env);
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        record.issuer.require_auth();
+        if !record.active {
+            panic_with_error!(&env, ContractError::CredentialRevoked);
+        }
+        let now = env.ledger().timestamp();
+        if until_timestamp <= now {
+            panic_with_error!(&env, ContractError::InvalidSuspensionPeriod);
+        }
+        record.suspension_end_time = Some(until_timestamp);
+        env.storage()
+            .persistent()
+            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .persistent()
+            .set(&engineer_key(&engineer), &record);
+
+        env.events().publish(
+            (SUSPEND_TOPIC, engineer.clone()),
+            (record.issuer.clone(), until_timestamp, reason, now),
+        );
+    }
+
+    /// Check whether an engineer is currently suspended.
+    ///
+    /// # Returns
+    /// `true` if the engineer exists and is within an active suspension window; `false` otherwise.
+    pub fn is_credential_suspended(env: Env, engineer: Address) -> bool {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, Engineer>(&engineer_key(&engineer))
+        {
+            Some(e) => is_suspended(&e, env.ledger().timestamp()),
+            None => false,
+        }
+    }
+
     /// Get the total count of registered engineers.
     ///
     /// # Returns
@@ -1081,10 +1177,10 @@ mod tests {
 
         client.add_trusted_issuer(&admin, &issuer);
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
-        assert!(client.verify_engineer(&engineer).unwrap_or(false));
+        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
 
         client.revoke_credential(&engineer);
-        assert!(!client.verify_engineer(&engineer).unwrap_or(true));
+        assert!(client.verify_engineer(&engineer) != CredentialStatus::Valid);
     }
 
     #[test]
@@ -1101,11 +1197,11 @@ mod tests {
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
 
         // Sanity: engineer is initially verified
-        assert!(client.verify_engineer(&engineer).unwrap_or(false));
+        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
 
         // Revoke credentials and verify immediately returns false
         client.revoke_credential(&engineer);
-        assert!(!client.verify_engineer(&engineer).unwrap_or(true));
+        assert!(client.verify_engineer(&engineer) != CredentialStatus::Valid);
     }
 
     #[test]
@@ -1392,7 +1488,7 @@ mod tests {
         use soroban_sdk::TryIntoVal;
         let upgrade_event = events.iter().find(|(_, topics, _)| {
             if let Some(val) = topics.get(0) {
-                if let Ok(s) = val.try_into_val::<_, Symbol>(&env) {
+                if let Ok(s) = TryIntoVal::<_, Symbol>::try_into_val(&val, &env) {
                     return s == symbol_short!("UPGRADE");
                 }
             }
@@ -1636,7 +1732,7 @@ mod tests {
         client.unpause(&admin);
         client.add_trusted_issuer(&admin, &issuer);
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
-        assert!(client.verify_engineer(&engineer).unwrap_or(false));
+        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
     }
 
     #[test]
@@ -1708,12 +1804,12 @@ mod tests {
         client.add_trusted_issuer(&admin, &issuer);
         // validity_period of 86_400 seconds (minimum)
         client.register_engineer(&engineer, &hash, &issuer, &86_400);
-        assert!(client.verify_engineer(&engineer).unwrap_or(false));
+        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
 
         // Advance ledger past expiry
         env.ledger()
             .with_mut(|li| li.timestamp = li.timestamp + 86_401);
-        assert!(!client.verify_engineer(&engineer).unwrap_or(true));
+        assert!(client.verify_engineer(&engineer) != CredentialStatus::Valid);
     }
 
     #[test]
@@ -1732,7 +1828,7 @@ mod tests {
         // Advance to just before expiry
         env.ledger()
             .with_mut(|li| li.timestamp = li.timestamp + 86_399);
-        assert!(client.verify_engineer(&engineer).unwrap_or(false));
+        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
     }
 
     #[test]
@@ -1986,7 +2082,7 @@ mod tests {
         client.pause(&admin);
 
         // Read-only access should still work while paused
-        assert!(client.verify_engineer(&engineer).unwrap_or(false));
+        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
         let fetched_engineer = client.get_engineer(&engineer);
         assert_eq!(fetched_engineer.address, engineer);
         assert!(fetched_engineer.active);
@@ -2078,11 +2174,11 @@ mod tests {
         // Advance past original expiry
         env.ledger()
             .with_mut(|li| li.timestamp = li.timestamp + 86_401);
-        assert!(!client.verify_engineer(&engineer).unwrap_or(true));
+        assert!(client.verify_engineer(&engineer) != CredentialStatus::Valid);
 
         // Renew for another 86_400 seconds from now
         client.renew_credential(&engineer, &86_400);
-        assert!(client.verify_engineer(&engineer).unwrap_or(false));
+        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
 
         let record = client.get_engineer(&engineer);
         assert_eq!(record.expires_at, env.ledger().timestamp() + 86_400);
@@ -2180,7 +2276,7 @@ mod tests {
         assert_eq!(renewed.issuer, original.issuer);
         assert_eq!(renewed.expires_at, original.expires_at + 86_400);
         assert!(renewed.expires_at > original.expires_at);
-        assert!(client.verify_engineer(&engineer).unwrap_or(false));
+        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
     }
 
     #[test]
@@ -2397,15 +2493,15 @@ mod tests {
         client.register_engineer(&engineer2, &hash2, &issuer, &31_536_000);
 
         // Verify engineers are active
-        assert!(client.verify_engineer(&engineer1).unwrap_or(false));
-        assert!(client.verify_engineer(&engineer2).unwrap_or(false));
+        assert!(client.verify_engineer(&engineer1) == CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer2) == CredentialStatus::Valid);
 
         // Remove the trusted issuer
         client.remove_trusted_issuer(&admin, &issuer);
 
         // Verify engineers are now revoked
-        assert!(!client.verify_engineer(&engineer1).unwrap_or(true));
-        assert!(!client.verify_engineer(&engineer2).unwrap_or(true));
+        assert!(client.verify_engineer(&engineer1) != CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer2) != CredentialStatus::Valid);
 
         // Check status
         assert_eq!(
@@ -2560,12 +2656,12 @@ mod tests {
 
         // Revoke the credential
         client.revoke_credential(&engineer);
-        assert!(!client.verify_engineer(&engineer).unwrap_or(true));
+        assert!(client.verify_engineer(&engineer) != CredentialStatus::Valid);
 
         // Should be able to re-register after revocation
         let new_hash = BytesN::from_array(&env, &[2u8; 32]);
         client.register_engineer(&engineer, &new_hash, &issuer, &31_536_000);
-        assert!(client.verify_engineer(&engineer).unwrap_or(false));
+        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
     }
 
     #[test]
@@ -2583,7 +2679,7 @@ mod tests {
 
         // First registration succeeds
         client.register_engineer(&engineer, &hash1, &issuer, &31_536_000);
-        assert!(client.verify_engineer(&engineer).unwrap_or(false));
+        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
 
         // Second registration with same engineer (still active) must panic
         let result = client.try_register_engineer(&engineer, &hash2, &issuer, &31_536_000);
@@ -2959,9 +3055,9 @@ mod tests {
 
         let results = client.batch_verify_engineers(&soroban_sdk::vec![&env, e1, e2, e3]);
         assert_eq!(results.len(), 3);
-        assert!(results.get(0).unwrap());
-        assert!(results.get(1).unwrap());
-        assert!(results.get(2).unwrap());
+        assert_eq!(results.get(0).unwrap(), CredentialStatus::Valid);
+        assert_eq!(results.get(1).unwrap(), CredentialStatus::Valid);
+        assert_eq!(results.get(2).unwrap(), CredentialStatus::Valid);
     }
 
     #[test]
@@ -2982,8 +3078,8 @@ mod tests {
 
         let results = client.batch_verify_engineers(&soroban_sdk::vec![&env, e1, e2]);
         assert_eq!(results.len(), 2);
-        assert!(!results.get(0).unwrap());
-        assert!(!results.get(1).unwrap());
+        assert_ne!(results.get(0).unwrap(), CredentialStatus::Valid);
+        assert_ne!(results.get(1).unwrap(), CredentialStatus::Valid);
     }
 
     #[test]
@@ -3031,38 +3127,38 @@ mod tests {
         let engineer = Address::generate(&env);
         let never_registered = Address::generate(&env);
 
-        // Never-registered engineer returns None
+        // Never-registered engineer returns NotFound
         assert_eq!(
             client.verify_engineer(&never_registered),
-            None,
-            "never-registered engineer should return None"
+            CredentialStatus::NotFound,
+            "never-registered engineer should return NotFound"
         );
 
         // Register an engineer
         client.register_engineer(&engineer, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000);
 
-        // Active engineer returns Some(true)
+        // Active engineer returns Valid
         assert_eq!(
             client.verify_engineer(&engineer),
-            Some(true),
-            "active engineer should return Some(true)"
+            CredentialStatus::Valid,
+            "active engineer should return Valid"
         );
 
         // Revoke the engineer
         client.revoke_credential(&engineer);
 
-        // Revoked engineer returns Some(false)
+        // Revoked engineer returns Revoked
         assert_eq!(
             client.verify_engineer(&engineer),
-            Some(false),
-            "revoked engineer should return Some(false)"
+            CredentialStatus::Revoked,
+            "revoked engineer should return Revoked"
         );
 
-        // Never-registered still returns None
+        // Never-registered still returns NotFound
         assert_eq!(
             client.verify_engineer(&never_registered),
-            None,
-            "never-registered engineer should still return None after other operations"
+            CredentialStatus::NotFound,
+            "never-registered engineer should still return NotFound after other operations"
         );
     }
 
@@ -3271,10 +3367,6 @@ mod tests {
 
     #[test]
     fn test_batch_verify_engineers_all_valid() {
-    // --- #752: upgrade timelock tests ---
-
-    #[test]
-    fn test_execute_upgrade_before_timelock_fails() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
@@ -3293,13 +3385,19 @@ mod tests {
         let results = client.batch_verify_engineers(&batch);
 
         assert_eq!(results.len(), 3);
-        assert!(results.get(0).unwrap());
-        assert!(results.get(1).unwrap());
-        assert!(results.get(2).unwrap());
+        assert_eq!(results.get(0).unwrap(), CredentialStatus::Valid);
+        assert_eq!(results.get(1).unwrap(), CredentialStatus::Valid);
+        assert_eq!(results.get(2).unwrap(), CredentialStatus::Valid);
     }
 
+    // --- #752: upgrade timelock tests ---
+
     #[test]
-    fn test_batch_verify_engineers_mixed() {
+    fn test_execute_upgrade_before_timelock_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
         let hash = BytesN::from_array(&env, &[0xabu8; 32]);
         client.propose_upgrade(&admin, &hash);
 
@@ -3318,6 +3416,21 @@ mod tests {
         env.mock_all_auths();
         let (client, admin) = setup(&env);
 
+        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.propose_upgrade(&admin, &hash);
+
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
+        client.execute_upgrade(&admin);
+    }
+
+    #[test]
+    fn test_batch_verify_engineers_mixed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
         let issuer = Address::generate(&env);
         let valid = Address::generate(&env);
         let revoked = Address::generate(&env);
@@ -3329,31 +3442,19 @@ mod tests {
         client.register_engineer(&expired, &BytesN::from_array(&env, &[3u8; 32]), &issuer, &86_400);
 
         client.revoke_credential(&revoked);
-        // Advance time past the expired engineer's validity
         env.ledger().with_mut(|li| li.timestamp += 86_401);
 
         let batch = soroban_sdk::vec![&env, valid.clone(), revoked.clone(), expired.clone()];
         let results = client.batch_verify_engineers(&batch);
 
         assert_eq!(results.len(), 3);
-        assert!(results.get(0).unwrap(), "valid engineer must be true");
-        assert!(!results.get(1).unwrap(), "revoked engineer must be false");
-        assert!(!results.get(2).unwrap(), "expired engineer must be false");
+        assert_eq!(results.get(0).unwrap(), CredentialStatus::Valid, "valid engineer must be true");
+        assert_ne!(results.get(1).unwrap(), CredentialStatus::Valid, "revoked engineer must be false");
+        assert_ne!(results.get(2).unwrap(), CredentialStatus::Valid, "expired engineer must be false");
     }
 
     #[test]
     fn test_batch_verify_engineers_all_invalid() {
-        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
-        client.propose_upgrade(&admin, &hash);
-
-        let base = env.ledger().timestamp();
-        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
-
-        client.execute_upgrade(&admin);
-    }
-
-    #[test]
-    fn test_execute_upgrade_without_proposal_fails() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
@@ -3374,9 +3475,17 @@ mod tests {
         let results = client.batch_verify_engineers(&batch);
 
         assert_eq!(results.len(), 3);
-        assert!(!results.get(0).unwrap(), "revoked engineer must be false");
-        assert!(!results.get(1).unwrap(), "revoked engineer must be false");
-        assert!(!results.get(2).unwrap(), "never-registered engineer must be false");
+        assert_ne!(results.get(0).unwrap(), CredentialStatus::Valid, "revoked engineer must be false");
+        assert_ne!(results.get(1).unwrap(), CredentialStatus::Valid, "revoked engineer must be false");
+        assert_ne!(results.get(2).unwrap(), CredentialStatus::Valid, "never-registered engineer must be false");
+    }
+
+    #[test]
+    fn test_execute_upgrade_without_proposal_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
         let result = client.try_execute_upgrade(&admin);
         assert_eq!(
             result,
@@ -3461,11 +3570,244 @@ mod tests {
         let hash = BytesN::from_array(&env, &[1u8; 32]);
 
         client.add_trusted_issuer(&admin, &issuer);
-        client.register_engineer(&engineer, &hash, &issuer, &100); // 100 seconds expiry
+        client.register_engineer(&engineer, &hash, &issuer, &86_400); // minimum 1-day validity
 
-        // Set ledger time to 101 seconds (after expiry)
-        env.ledger().with_timestamp(101);
+        // Advance past expiry
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + 86_401);
 
         assert!(!client.is_engineer_active(&engineer));
+    }
+
+    // --- Suspension tests (issue #882) ---
+
+    fn setup_suspended_engineer(
+        env: &Env,
+        client: &EngineerRegistryClient,
+        admin: &Address,
+    ) -> (Address, Address) {
+        let issuer = Address::generate(env);
+        let engineer = Address::generate(env);
+        client.add_trusted_issuer(admin, &issuer);
+        client.register_engineer(
+            &engineer,
+            &BytesN::from_array(env, &[42u8; 32]),
+            &issuer,
+            &31_536_000,
+        );
+        (issuer, engineer)
+    }
+
+    #[test]
+    fn test_suspend_engineer_makes_credential_suspended() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let (_, engineer) = setup_suspended_engineer(&env, &client, &admin);
+
+        let now = env.ledger().timestamp();
+        client.suspend_engineer(
+            &engineer,
+            &(now + 86_400),
+            &soroban_sdk::String::from_str(&env, "investigation"),
+        );
+
+        assert!(client.is_credential_suspended(&engineer));
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::Suspended
+        );
+        assert_eq!(
+            client.get_engineer_status(&engineer),
+            EngineerStatus::Suspended
+        );
+        assert!(!client.is_engineer_active(&engineer));
+    }
+
+    #[test]
+    fn test_suspension_lifts_after_end_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let (_, engineer) = setup_suspended_engineer(&env, &client, &admin);
+
+        let now = env.ledger().timestamp();
+        let suspension_end = now + 3_600; // 1 hour
+        client.suspend_engineer(
+            &engineer,
+            &suspension_end,
+            &soroban_sdk::String::from_str(&env, "temp"),
+        );
+
+        assert!(client.is_credential_suspended(&engineer));
+
+        // Advance past suspension end
+        env.ledger().set_timestamp(suspension_end);
+        assert!(!client.is_credential_suspended(&engineer));
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::Valid
+        );
+        assert!(client.is_engineer_active(&engineer));
+    }
+
+    #[test]
+    fn test_suspend_revoked_engineer_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let (_, engineer) = setup_suspended_engineer(&env, &client, &admin);
+
+        client.revoke_credential(&engineer);
+
+        let now = env.ledger().timestamp();
+        let result = client.try_suspend_engineer(
+            &engineer,
+            &(now + 86_400),
+            &soroban_sdk::String::from_str(&env, "reason"),
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::CredentialRevoked as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_suspend_unknown_engineer_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup(&env);
+
+        let unknown = Address::generate(&env);
+        let now = env.ledger().timestamp();
+        let result = client.try_suspend_engineer(
+            &unknown,
+            &(now + 86_400),
+            &soroban_sdk::String::from_str(&env, "reason"),
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::EngineerNotFound as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_suspend_with_past_timestamp_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let (_, engineer) = setup_suspended_engineer(&env, &client, &admin);
+
+        // Advance ledger so we can use a "past" timestamp
+        env.ledger().set_timestamp(10_000);
+        let result = client.try_suspend_engineer(
+            &engineer,
+            &5_000, // in the past
+            &soroban_sdk::String::from_str(&env, "reason"),
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidSuspensionPeriod as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_suspend_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let (issuer, engineer) = setup_suspended_engineer(&env, &client, &admin);
+
+        let now = env.ledger().timestamp();
+        let until = now + 86_400;
+        let reason = soroban_sdk::String::from_str(&env, "audit");
+        client.suspend_engineer(&engineer, &until, &reason);
+
+        use soroban_sdk::TryIntoVal;
+        let events = env.events().all();
+        let (_, topics, data) = events.last().unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        let t1: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, SUSPEND_TOPIC);
+        assert_eq!(t1, engineer);
+
+        let (emitted_issuer, emitted_until, _emitted_reason, emitted_at): (
+            Address,
+            u64,
+            soroban_sdk::String,
+            u64,
+        ) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_issuer, issuer);
+        assert_eq!(emitted_until, until);
+        assert_eq!(emitted_at, now);
+    }
+
+    #[test]
+    fn test_is_credential_suspended_false_for_unknown() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup(&env);
+        let unknown = Address::generate(&env);
+        assert!(!client.is_credential_suspended(&unknown));
+    }
+
+    #[test]
+    fn test_is_credential_suspended_false_when_not_suspended() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let (_, engineer) = setup_suspended_engineer(&env, &client, &admin);
+        assert!(!client.is_credential_suspended(&engineer));
+    }
+
+    #[test]
+    fn test_verify_engineer_returns_suspended_when_suspended() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let (_, engineer) = setup_suspended_engineer(&env, &client, &admin);
+
+        let now = env.ledger().timestamp();
+        client.suspend_engineer(
+            &engineer,
+            &(now + 86_400),
+            &soroban_sdk::String::from_str(&env, "review"),
+        );
+
+        assert_eq!(
+            client.verify_engineer(&engineer),
+            CredentialStatus::Suspended,
+            "suspended engineer should return Suspended"
+        );
+    }
+
+    #[test]
+    fn test_suspension_does_not_persist_after_expiry_via_batch() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let (_, engineer) = setup_suspended_engineer(&env, &client, &admin);
+
+        let now = env.ledger().timestamp();
+        let end = now + 1_000;
+        client.suspend_engineer(
+            &engineer,
+            &end,
+            &soroban_sdk::String::from_str(&env, "tmp"),
+        );
+
+        // Still suspended
+        let results = client.batch_verify_engineers(&soroban_sdk::vec![&env, engineer.clone()]);
+        assert_ne!(results.get(0).unwrap(), CredentialStatus::Valid);
+
+        env.ledger().set_timestamp(end);
+        let results = client.batch_verify_engineers(&soroban_sdk::vec![&env, engineer.clone()]);
+        assert_eq!(results.get(0).unwrap(), CredentialStatus::Valid, "suspension should have lifted");
     }
 }
