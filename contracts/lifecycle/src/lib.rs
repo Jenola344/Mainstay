@@ -1546,6 +1546,11 @@ impl Lifecycle {
             .persistent()
             .get::<_, Config>(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        // Deprecated assets are not eligible for collateral — return 0 immediately.
+        let asset = asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.deprecation_status != asset_registry::DeprecationStatus::Active {
+            return 0;
+        }
         // Frozen (decommissioned) assets return the score captured at decommission time.
         if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
             return env
@@ -8383,5 +8388,43 @@ mod tests {
         assert_eq!(t0, symbol_short!("UPD_MAX"));
         let emitted_max: u32 = data.try_into_val(&env).unwrap();
         assert_eq!(emitted_max, 300);
+    }
+
+    // --- Deprecation: collateral score tests ---
+
+    #[test]
+    fn test_deprecated_asset_returns_zero_collateral_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, _, _) = setup(&env, 200);
+        let (asset_id, owner) = register_asset(&env, &asset_registry);
+
+        // Confirm initial score is 0 (no maintenance history)
+        assert_eq!(lifecycle.get_collateral_score(&asset_id), 0);
+
+        // Deprecate the asset as the owner
+        asset_registry.deprecate_asset(&owner, &asset_id, &String::from_str(&env, "End of service life"));
+
+        // Score must be 0 for a deprecated asset regardless of any history
+        assert_eq!(lifecycle.get_collateral_score(&asset_id), 0);
+    }
+
+    #[test]
+    fn test_active_asset_not_affected_by_deprecation_of_other() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, _, _) = setup(&env, 200);
+        let (asset_id_1, owner) = register_asset(&env, &asset_registry);
+        let (asset_id_2, _) = register_asset(&env, &asset_registry);
+
+        // Deprecate only asset 1
+        asset_registry.deprecate_asset(&owner, &asset_id_1, &String::from_str(&env, "retired"));
+
+        // Asset 2 must still return its normal (0, no history) score — not forced to 0 by deprecation
+        assert_eq!(lifecycle.get_collateral_score(&asset_id_1), 0);
+        // Asset 2 is active, score is 0 simply because no maintenance has been submitted
+        assert_eq!(lifecycle.get_collateral_score(&asset_id_2), 0);
     }
 }

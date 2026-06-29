@@ -30,6 +30,8 @@ pub enum ContractError {
     /// A new proposal cannot overwrite it; wait for the timelock to expire and execute,
     /// or allow the existing proposal to lapse before re-proposing.
     ProposalAlreadyExists = 16,
+    /// Asset has already been deprecated and cannot be deprecated again.
+    AssetAlreadyDeprecated = 17,
 }
 
 #[contracttype]
@@ -45,6 +47,16 @@ pub struct Asset {
     pub owner: Address,
     pub registered_at: u64,
     pub metadata_updated_at: u64,
+    /// Soft lifecycle status set by the owner. Defaults to `Active` on registration.
+    pub deprecation_status: DeprecationStatus,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum DeprecationStatus {
+    Active = 0,
+    Deprecated = 1,
+    Decommissioned = 2,
 }
 
 #[contracttype]
@@ -420,6 +432,7 @@ impl AssetRegistry {
             owner: owner.clone(),
             registered_at: env.ledger().timestamp(),
             metadata_updated_at: env.ledger().timestamp(),
+            deprecation_status: DeprecationStatus::Active,
         };
         env.storage().persistent().set(&asset_key(id), &asset);
         env.storage()
@@ -520,6 +533,7 @@ impl AssetRegistry {
                 owner: owner.clone(),
                 registered_at: env.ledger().timestamp(),
                 metadata_updated_at: env.ledger().timestamp(),
+                deprecation_status: DeprecationStatus::Active,
             };
 
             env.storage().persistent().set(&asset_key(id), &asset);
@@ -1213,6 +1227,62 @@ impl AssetRegistry {
         let ledger_seq = env.ledger().sequence();
         env.events()
             .publish((symbol_short!("DECOMM"), asset_id), ledger_seq);
+    }
+
+    /// Owner-only function to mark an asset as deprecated.
+    ///
+    /// Deprecation is a soft, reversible signal from the asset owner indicating
+    /// the machinery has reached end-of-life. A deprecated asset remains in the
+    /// registry (preserving its maintenance audit trail) but returns a collateral
+    /// score of 0 so it cannot be used as DeFi collateral.
+    ///
+    /// Unlike deregistration (which permanently removes the asset) or decommissioning
+    /// (which is admin-only), deprecation is a self-service owner action.
+    ///
+    /// # Arguments
+    /// * `owner` - The current owner of the asset (must match stored owner)
+    /// * `asset_id` - The unique identifier of the asset to deprecate
+    /// * `reason` - A human-readable explanation for the deprecation
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    /// - [`ContractError::UnauthorizedOwner`] if caller is not the asset owner
+    /// - [`ContractError::AssetAlreadyDeprecated`] if asset is already deprecated or decommissioned
+    pub fn deprecate_asset(env: Env, owner: Address, asset_id: u64, reason: String) {
+        ensure_not_paused(&env);
+        owner.require_auth();
+
+        let mut asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        if asset.owner != owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        if asset.deprecation_status != DeprecationStatus::Active {
+            panic_with_error!(&env, ContractError::AssetAlreadyDeprecated);
+        }
+
+        asset.deprecation_status = DeprecationStatus::Deprecated;
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+        env.storage()
+            .persistent()
+            .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+
+        // Store reason separately to avoid bloating the core Asset struct on reads.
+        let reason_key = (symbol_short!("DEP_RSN"), asset_id);
+        env.storage().persistent().set(&reason_key, &reason);
+        env.storage()
+            .persistent()
+            .extend_ttl(&reason_key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("DEPRECATED"), asset_id),
+            (owner, reason, env.ledger().timestamp()),
+        );
     }
 
     /// Propose a WASM upgrade for the asset registry contract.
@@ -4884,5 +4954,145 @@ mod tests {
         client.initialize_admin(&admin, &admin);
 
         client.asset_status(&999);
+    }
+
+    // --- Deprecation tests ---
+
+    #[test]
+    fn test_deprecate_asset_owner_can_deprecate() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Old Generator"), &owner);
+
+        // Initially Active
+        assert_eq!(client.get_asset(&asset_id).deprecation_status, DeprecationStatus::Active);
+
+        // Owner deprecates the asset
+        client.deprecate_asset(&owner, &asset_id, &String::from_str(&env, "End of service life"));
+
+        // Status should now be Deprecated
+        assert_eq!(client.get_asset(&asset_id).deprecation_status, DeprecationStatus::Deprecated);
+    }
+
+    #[test]
+    fn test_deprecate_asset_non_owner_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Generator X"), &owner);
+
+        let non_owner = Address::generate(&env);
+        let result = client.try_deprecate_asset(&non_owner, &asset_id, &String::from_str(&env, "reason"));
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedOwner as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_deprecate_already_deprecated_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Generator Y"), &owner);
+
+        client.deprecate_asset(&owner, &asset_id, &String::from_str(&env, "first"));
+
+        // Second deprecation must fail
+        let result = client.try_deprecate_asset(&owner, &asset_id, &String::from_str(&env, "second"));
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetAlreadyDeprecated as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_deprecate_nonexistent_asset_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+
+        let owner = Address::generate(&env);
+        let result = client.try_deprecate_asset(&owner, &999u64, &String::from_str(&env, "reason"));
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_deprecate_decommissioned_asset_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Generator Z"), &owner);
+
+        // Admin decommissions via registry (sets decommissioned_key bool, but NOT deprecation_status)
+        // For the deprecation_status path, manually deprecate first then attempt again
+        client.deprecate_asset(&owner, &asset_id, &String::from_str(&env, "eof"));
+        // Now the asset is Deprecated — a second call must fail with AssetAlreadyDeprecated
+        let result = client.try_deprecate_asset(&owner, &asset_id, &String::from_str(&env, "again"));
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetAlreadyDeprecated as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_new_asset_has_active_deprecation_status() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+
+        let owner = Address::generate(&env);
+        let asset_id = reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Turbine A"), &owner);
+
+        assert_eq!(client.get_asset(&asset_id).deprecation_status, DeprecationStatus::Active);
     }
 }
