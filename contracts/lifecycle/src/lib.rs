@@ -281,6 +281,9 @@ mod engineer_registry {
     #[allow(dead_code)]
     #[contractclient(name = "EngineerRegistryClient")]
     pub trait EngineerRegistry {
+        fn verify_engineer(env: Env, engineer: Address) -> Option<bool>;
+        fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<bool>;
+        fn get_reputation(env: Env, engineer: Address) -> u32;
         fn verify_engineer(env: Env, engineer: Address) -> CredentialStatus;
         fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<CredentialStatus>;
         fn get_credential_status(env: Env, engineer: Address) -> CredentialStatus;
@@ -1182,12 +1185,16 @@ impl Lifecycle {
         engineer_history_add(&env, &engineer, asset_id, config.max_history);
 
         // Accumulate score: add this submission's increment to the stored score (cap at 100).
+        // Weight the increment by the engineer's reputation (0–1000), scaled to 0.5×–1.5×:
+        //   multiplier = (500 + reputation) / 1000  (reputation=0 → 0.5×, 500 → 1.0×, 1000 → 1.5×)
+        let reputation = registry.get_reputation(&engineer);
+        let weighted_increment = ((config.score_increment as u64) * (500 + reputation as u64) / 1000) as u32;
         let current_score: u32 = env
             .storage()
             .persistent()
             .get(&score_key(asset_id))
             .unwrap_or(0);
-        let new_score = current_score.saturating_add(config.score_increment).min(100);
+        let new_score = current_score.saturating_add(weighted_increment).min(100);
 
         // Persist the accumulated score so apply_decay / get_collateral_score can read it.
         env.storage().persistent().set(&score_key(asset_id), &new_score);
@@ -1372,6 +1379,8 @@ impl Lifecycle {
         }
 
         // Build all records and compute final score before any write.
+        let reputation = engineer_registry_client.get_reputation(&engineer);
+        let weighted_increment = ((config.score_increment as u64) * (500 + reputation as u64) / 1000) as u32;
         let mut score: u32 = env
             .storage()
             .persistent()
@@ -1382,7 +1391,7 @@ impl Lifecycle {
         let mut score_entries: Vec<ScoreEntry> = Vec::new(&env);
         for record in records.iter() {
             score = score
-                .checked_add(config.score_increment)
+                .checked_add(weighted_increment)
                 .map(|s| s.min(100))
                 .unwrap_or_else(|| panic_with_error!(&env, ContractError::ScoreOverflow));
             new_records.push_back(MaintenanceRecord {
@@ -2668,6 +2677,8 @@ mod tests {
         registry_client.initialize_admin(&admin, &admin);
         registry_client.add_trusted_issuer(&admin, &issuer);
         registry_client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+        // Set reputation to 500 (neutral 1.0× multiplier) so existing score assertions hold
+        registry_client.update_reputation(&engineer, &500);
         engineer
     }
 
@@ -8627,6 +8638,9 @@ mod tests {
         assert_eq!(emitted_max, 300);
     }
 
+    #[test]
+    fn test_reputation_zero_halves_score_increment() {
+        // reputation=0 → multiplier 0.5× → 5 * 500/1000 = 2 per submission
     // --- Health Snapshot Tests ---
 
     #[test]
@@ -8655,6 +8669,19 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
+        // reputation starts at 0 → weighted_increment = 5 * 500 / 1000 = 2
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "oil change"),
+            &engineer,
+        );
+        assert_eq!(client.get_collateral_score(&asset_id), 2);
+    }
+
+    #[test]
+    fn test_reputation_500_gives_base_score_increment() {
+        // reputation=500 → multiplier 1.0× → 5 * 1000/1000 = 5 per submission
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
@@ -8687,6 +8714,93 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
+        engineer_registry_client.update_reputation(&engineer, &500);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "oil change"),
+            &engineer,
+        );
+        assert_eq!(client.get_collateral_score(&asset_id), 5);
+    }
+
+    #[test]
+    fn test_reputation_1000_gives_max_score_increment() {
+        // reputation=1000 → multiplier 1.5× → 5 * 1500/1000 = 7 per submission
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        engineer_registry_client.update_reputation(&engineer, &1000);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "oil change"),
+            &engineer,
+        );
+        assert_eq!(client.get_collateral_score(&asset_id), 7);
+    }
+
+    #[test]
+    fn test_higher_reputation_yields_higher_collateral_score() {
+        // Two engineers submit identical maintenance; higher-reputation engineer
+        // should result in a higher collateral score on their asset.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+
+        let (asset_a, owner_a) = register_asset(&env, &asset_registry_client);
+        let (asset_b, owner_b) = register_asset(&env, &asset_registry_client);
+
+        let eng_low = register_engineer(&env, &engineer_registry_client);
+        // eng_high needs its own issuer/admin setup — reuse the existing helper indirectly
+        let eng_high = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let admin_h = Address::generate(&env);
+        engineer_registry_client.initialize_admin(&admin_h, &admin_h);
+        engineer_registry_client.add_trusted_issuer(&admin_h, &issuer);
+        engineer_registry_client.register_engineer(
+            &eng_high,
+            &BytesN::from_array(&env, &[7u8; 32]),
+            &issuer,
+            &31_536_000,
+        );
+
+        // eng_low: reputation 0, eng_high: reputation 1000
+        engineer_registry_client.update_reputation(&eng_high, &1000);
+
+        client.authorize_engineer(&owner_a, &asset_a, &eng_low);
+        client.authorize_engineer(&owner_b, &asset_b, &eng_high);
+
+        client.submit_maintenance(
+            &asset_a,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "routine"),
+            &eng_low,
+        );
+        client.submit_maintenance(
+            &asset_b,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "routine"),
+            &eng_high,
+        );
+
+        let score_low = client.get_collateral_score(&asset_a);
+        let score_high = client.get_collateral_score(&asset_b);
+        assert!(
+            score_high > score_low,
+            "Higher reputation engineer should yield higher collateral score: {} vs {}",
+            score_high,
+            score_low,
+        );
+    }
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
