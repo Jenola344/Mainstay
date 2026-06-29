@@ -714,10 +714,17 @@ impl AssetRegistry {
     /// # Panics
     /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
     pub fn get_asset(env: Env, asset_id: u64) -> Asset {
+        let key = asset_key(asset_id);
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        // Extend TTL on read to prevent stale data after TTL expiry
         env.storage()
             .persistent()
-            .get(&asset_key(asset_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound))
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        asset
     }
 
     /// Returns true if an asset with the given ID exists, false otherwise.
@@ -751,6 +758,10 @@ impl AssetRegistry {
             .unwrap_or(false);
 
         if is_decommissioned {
+            // Extend TTL on read
+            env.storage()
+                .persistent()
+                .extend_ttl(&decomm_key, TTL_THRESHOLD, TTL_TARGET);
             return AssetStatus::Decommissioned;
         }
 
@@ -763,8 +774,17 @@ impl AssetRegistry {
             .unwrap_or(false);
 
         if is_under_maintenance {
+            // Extend TTL on read
+            env.storage()
+                .persistent()
+                .extend_ttl(&maint_key, TTL_THRESHOLD, TTL_TARGET);
             return AssetStatus::UnderMaintenance;
         }
+
+        // For Active status, extend TTL on the asset itself
+        env.storage()
+            .persistent()
+            .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         AssetStatus::Active
     }
@@ -1861,6 +1881,34 @@ mod tests {
                 ContractError::AssetNotFound as u32
             )))
         );
+    }
+
+    #[test]
+    fn test_get_asset_extends_ttl_on_read() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        // Read via get_asset — TTL must be extended
+        client.get_asset(&asset_id);
+
+        env.as_contract(&contract_id, || {
+            let ttl = env.storage().persistent().get_ttl(&asset_key(asset_id));
+            assert!(ttl > 0, "asset TTL must be extended on get_asset read");
+        });
     }
 
     #[test]
