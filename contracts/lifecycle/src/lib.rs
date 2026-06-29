@@ -1074,9 +1074,15 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::HistoryCapReached);
         }
 
-        // Verify asset exists
+        // Verify asset exists and is not decommissioned
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let status = asset_client.asset_status(&asset_id);
+        use asset_registry::AssetStatus;
+        if status == AssetStatus::Decommissioned {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
 
         // Cross-check engineer credential via registry
         let registry_id = get_engineer_registry_addr(&env);
