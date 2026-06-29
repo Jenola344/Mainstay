@@ -13,6 +13,13 @@ Thank you for your interest in contributing to Mainstay.
 - Describe how the change was tested or validated.
 - Include any relevant docs updates.
 - **Update CHANGELOG.md** with your changes (see [Changelog Updates](#changelog-updates) below).
+- Ensure secret scanning passes on PRs for `.env` and other configuration files.
+
+## Secret scanning
+- The repository uses `gitleaks` on PRs to detect real secrets before merge.
+- The `.gitleaks.toml` configuration contains standard secret rules plus false-positive allowlists for placeholder values.
+- Do not commit real API keys, tokens, or credential files to any branch.
+- If a false positive is detected, update `.gitleaks.toml` only after verifying the content is safe.
 
 ## Changelog updates
 
