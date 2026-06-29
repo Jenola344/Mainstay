@@ -86,6 +86,8 @@ fn frozen_key(asset_id: u64) -> (Symbol, u64) {
 
 fn frozen_score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("FRZ_SCR"), asset_id)
+}
+
 fn revoke_eng_timelock_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("RVK_TL"), asset_id, engineer.clone())
 }
@@ -555,9 +557,9 @@ impl Lifecycle {
         admin: Address,
         max_history: u32,
     ) {
-        if deployer != env.invoker() {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
+        // Soroban SDK removed `env.invoker()`; `require_auth` enforces the
+        // deployer's signature instead, matching the standard pattern used
+        // elsewhere in this contract.
         deployer.require_auth();
         if env.storage().persistent().has(&CONFIG) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
@@ -1126,14 +1128,14 @@ impl Lifecycle {
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
 
-        // Cross-check engineer credential via registry
+        // Cross-check engineer credential via registry. The lifecycle's
+        // own trait declares `verify_engineer -> Option<bool>` so we keep
+        // the bool contract here. The half-merged code that originally
+        // lived here left an unfinished `if status != ... {` that broke
+        // parsing; this is the closed-up version.
         let registry_id = get_engineer_registry_addr(&env);
         let registry = engineer_registry::EngineerRegistryClient::new(&env, &registry_id);
-        use engineer_registry::CredentialStatus;
-        let status = registry.verify_engineer(&engineer);
-        if status != CredentialStatus::Valid {
-        let verified = registry.verify_engineer(&engineer).unwrap_or(false);
-        if !verified {
+        if !registry.verify_engineer(&engineer).unwrap_or(false) {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
         require_engineer_authorized(&env, asset_id, &engineer);
@@ -1327,9 +1329,11 @@ impl Lifecycle {
         let engineer_registry = get_engineer_registry_addr(&env);
         let engineer_registry_client =
             engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry);
-        use engineer_registry::CredentialStatus;
-        let status = engineer_registry_client.verify_engineer(&engineer);
-        if status != CredentialStatus::Valid {
+        // Verify engineer credential through the batch path that already
+        // exists below. The half-merged `if status != CredentialStatus::Valid {`
+        // that originally lived here was never closed and broke parsing;
+        // the batch path is the same check intent expressed via the
+        // already-wired `batch_verify_engineers` API.
         let mut batch = Vec::new(&env);
         batch.push_back(engineer.clone());
         let results = engineer_registry_client.batch_verify_engineers(&batch);
@@ -1497,6 +1501,43 @@ impl Lifecycle {
             .persistent()
             .get(&history_key(asset_id))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Issue #799 — Option-returning variant of [`get_maintenance_history`].
+    ///
+    /// `get_maintenance_history` panics with `AssetNotFound` for assets
+    /// that were never registered AND returns an empty `Vec` for assets
+    /// that exist but have no history — two different failure modes that
+    /// callers using the SDK-generated `try_*` wrapper would still have
+    /// to disambiguate by hand.
+    ///
+    /// This variant collapses both signals into one return value:
+    ///
+    /// - `None` → the asset is not registered.
+    /// - `Some(vec![])` → the asset is registered but has no
+    ///   maintenance history yet.
+    /// - `Some(records)` → the asset is registered and has history.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset.
+    ///
+    /// # Returns
+    /// * `Option<Vec<MaintenanceRecord>>` - see the three cases above.
+    pub fn get_maintenance_history_opt(
+        env: Env,
+        asset_id: u64,
+    ) -> Option<Vec<MaintenanceRecord>> {
+        let asset_registry = get_asset_registry_addr(&env);
+        let client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        if client.try_get_asset(&asset_id).is_err() {
+            return None;
+        }
+        Some(
+            env.storage()
+                .persistent()
+                .get(&history_key(asset_id))
+                .unwrap_or(Vec::new(&env)),
+        )
     }
 
     /// Get a paginated slice of the maintenance history for an asset.
@@ -1685,6 +1726,64 @@ impl Lifecycle {
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if the contract is not initialized
+    /// Issue #798 — Option-returning variant of [`get_collateral_score`].
+    ///
+    /// `get_collateral_score` panics with `AssetNotFound` for unregistered
+    /// assets, which forces every caller into the SDK-generated `try_*`
+    /// wrapper plus an error-type check. This variant collapses both
+    /// signals into a single return value so callers can distinguish
+    /// "unregistered" from "registered but score == 0" (e.g. deprecated,
+    /// frozen-at-0, or fully-decayed):
+    ///
+    /// - `None` → the asset is not registered.
+    /// - `Some(0)` → the asset is registered but has no positive score
+    ///   (deprecated, decommissioned-at-zero, or fully decayed).
+    /// - `Some(n)` → the asset is registered with score `n` (0..=100).
+    ///
+    /// Unlike `get_collateral_score` this is **read-only**: it does not
+    /// persist the recomputed score or bump TTL. Callers that want the
+    /// side effects should call `get_collateral_score` directly.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset.
+    ///
+    /// # Returns
+    /// * `Option<u32>` - see the three cases above.
+    pub fn get_collateral_score_opt(env: Env, asset_id: u64) -> Option<u32> {
+        let asset_registry = get_asset_registry_addr(&env);
+        let client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        if client.try_get_asset(&asset_id).is_err() {
+            return None;
+        }
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get::<_, Config>(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        // Mirror the deprecation + frozen handling of `get_collateral_score`
+        // exactly (read-only path).
+        let asset = client.get_asset(&asset_id);
+        if asset.deprecation_status != asset_registry::DeprecationStatus::Active {
+            return Some(0);
+        }
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&frozen_key(asset_id))
+            .unwrap_or(false)
+        {
+            return Some(
+                env.storage()
+                    .persistent()
+                    .get(&frozen_score_key(asset_id))
+                    .unwrap_or(0),
+            );
+        }
+        // `apply_decay` is the same read-only score computation used by
+        // `get_collateral_score_batch` (which also passes `write=false`).
+        Some(apply_decay(&env, asset_id, false, false, config.max_history))
+    }
+
     pub fn get_collateral_score_batch(env: Env, asset_ids: Vec<u64>) -> Vec<(u64, u32)> {
         let config: Config = env
             .storage()
@@ -8528,6 +8627,8 @@ mod tests {
         assert_eq!(lifecycle.get_collateral_score(&asset_id_1), 0);
         // Asset 2 is active, score is 0 simply because no maintenance has been submitted
         assert_eq!(lifecycle.get_collateral_score(&asset_id_2), 0);
+    }
+
     // --- Issue #830: set_max_notes_length ---
 
     #[test]

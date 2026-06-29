@@ -33,7 +33,7 @@ pub enum ContractError {
     /// Asset has already been deprecated and cannot be deprecated again.
     AssetAlreadyDeprecated = 17,
     /// The batch exceeds the maximum allowed size.
-    BatchTooLarge = 17,
+    BatchTooLarge = 18,
 }
 
 #[contracttype]
@@ -918,9 +918,8 @@ impl AssetRegistry {
     /// - [`ContractError::AdminAlreadyInitialized`] if admin has already been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if deployer is not the transaction invoker
     pub fn initialize_admin(env: Env, deployer: Address, admin: Address) {
-        if deployer != env.invoker() {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
+        // Soroban SDK removed `env.invoker()`; rely on `require_auth` to enforce
+        // the deployer's signature instead, which is the standard pattern.
         deployer.require_auth();
         if env.storage().instance().has(&ADMIN_KEY) {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
@@ -1346,7 +1345,7 @@ impl AssetRegistry {
             .extend_ttl(&reason_key, TTL_THRESHOLD, TTL_TARGET);
 
         env.events().publish(
-            (symbol_short!("DEPRECATED"), asset_id),
+            (symbol_short!("DEPRCATED"), asset_id),
             (owner, reason, env.ledger().timestamp()),
         );
     }
