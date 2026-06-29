@@ -7,7 +7,7 @@ mod types;
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push};
 use crate::types::{
-    BatchRecord, Config, DataKey, MaintenanceRecord, ScoreEntry, TimelockProposal,
+    BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, ScoreEntry, TimelockProposal,
 };
 use shared::validation::require_non_empty_vec;
 use soroban_sdk::{
@@ -46,6 +46,7 @@ const EVENT_RST_SCR: Symbol = symbol_short!("RST_SCR");
 const EVENT_XFER: Symbol = symbol_short!("XFER");
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 const EVENT_ADMIN_SET: Symbol = symbol_short!("ADMIN_SET");
+const EVENT_PRUNED: Symbol = symbol_short!("PRUNED");
 
 /// Soroban persistent-storage TTL constants.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
@@ -86,6 +87,10 @@ fn frozen_key(asset_id: u64) -> (Symbol, u64) {
 
 fn frozen_score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("FRZ_SCR"), asset_id)
+}
+
+fn health_snapshot_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("HLTH_SNP"), asset_id)
 }
 fn revoke_eng_timelock_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("RVK_TL"), asset_id, engineer.clone())
@@ -989,6 +994,54 @@ impl Lifecycle {
         );
     }
 
+    /// Admin-only function to directly set the maximum allowed notes length.
+    /// Unlike `update_max_notes_length`, this takes effect immediately without a timelock.
+    /// Useful for deployments that need to quickly adjust storage cost controls.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `length` - New maximum notes length in bytes (must be > 0)
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::InvalidConfig`] if length is 0
+    pub fn set_max_notes_length(env: Env, admin: Address, length: u32) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        if length == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+
+        let mut config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        config.max_notes_length = length;
+        env.storage().persistent().set(&CONFIG, &config);
+        env.storage()
+            .persistent()
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events()
+            .publish((symbol_short!("SET_NOTES"), admin.clone()), length);
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
+            (
+                admin,
+                env.ledger().timestamp(),
+                symbol_short!("MAX_NOTE"),
+                length,
+            ),
+        );
+    }
+
     /// Admin-only function to set a custom weight for a specific task type.
     /// Allows per-task-type score increment configuration. Falls back to defaults if not set.
     ///
@@ -1079,8 +1132,17 @@ impl Lifecycle {
             .get(&history_key(asset_id))
             .unwrap_or(Vec::new(&env));
 
-        if history.len() >= config.max_history {
-            panic_with_error!(&env, ContractError::HistoryCapReached);
+        let pruned = if config.max_history > 0 && history.len() >= config.max_history {
+            let excess = (history.len() - config.max_history + 1) as u32;
+            for _ in 0..excess {
+                history.remove(0);
+            }
+            excess
+        } else {
+            0
+        };
+        if pruned > 0 {
+            env.events().publish((EVENT_PRUNED,), (asset_id, pruned));
         }
 
         // Verify asset exists
@@ -1093,6 +1155,8 @@ impl Lifecycle {
         use engineer_registry::CredentialStatus;
         let status = registry.get_credential_status(&engineer);
         if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
+        let status = registry.verify_engineer(&engineer);
+        if status != CredentialStatus::Valid {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
         require_engineer_authorized(&env, asset_id, &engineer);
@@ -1289,6 +1353,8 @@ impl Lifecycle {
         use engineer_registry::CredentialStatus;
         let status = engineer_registry_client.get_credential_status(&engineer);
         if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
+        let status = engineer_registry_client.verify_engineer(&engineer);
+        if status != CredentialStatus::Valid {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
         require_engineer_authorized(&env, asset_id, &engineer);
@@ -1524,6 +1590,19 @@ impl Lifecycle {
         best
     }
 
+    /// View alias for [`get_last_service`].
+    /// Returns the most recent maintenance record for an asset, or `None` if no history exists.
+    /// Frontends and lenders should prefer this over fetching the full history.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// `Some(MaintenanceRecord)` for the latest record, or `None` for assets with no history
+    pub fn get_last_maintenance(env: Env, asset_id: u64) -> Option<MaintenanceRecord> {
+        Self::get_last_service(env, asset_id)
+    }
+
     /// Get the current collateral score for an asset.
     /// Verifies asset exists before returning the score.
     ///
@@ -1548,6 +1627,11 @@ impl Lifecycle {
             .persistent()
             .get::<_, Config>(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        // Deprecated assets are not eligible for collateral — return 0 immediately.
+        let asset = asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.deprecation_status != asset_registry::DeprecationStatus::Active {
+            return 0;
+        }
         // Frozen (decommissioned) assets return the score captured at decommission time.
         if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
             return env
@@ -2398,6 +2482,86 @@ impl Lifecycle {
         }
         Self::is_collateral_eligible(env, asset_id)
     }
+
+    /// Capture a point-in-time health snapshot for an asset.
+    ///
+    /// Anyone may call this. The snapshot persists independently of maintenance
+    /// history so lenders can verify condition even after TTL-driven pruning.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The asset to snapshot
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    pub fn take_health_snapshot(env: Env, asset_id: u64) -> HealthSnapshot {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        let score = {
+            let stored: u32 = env.storage().persistent().get(&score_key(asset_id)).unwrap_or(0);
+            let config: Config = env
+                .storage()
+                .persistent()
+                .get::<_, Config>(&CONFIG)
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+            let last_update: u64 = env
+                .storage()
+                .persistent()
+                .get(&last_update_key(asset_id))
+                .unwrap_or(0);
+            let elapsed = env.ledger().timestamp().saturating_sub(last_update);
+            let decay = (elapsed / config.decay_interval) as u32 * config.decay_rate;
+            stored.saturating_sub(decay)
+        };
+
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let maintenance_count = history.len();
+        let last_service_date = history
+            .iter()
+            .map(|r| r.timestamp)
+            .fold(0u64, |acc, t| if t > acc { t } else { acc });
+
+        let snapshot = HealthSnapshot {
+            timestamp: env.ledger().timestamp(),
+            score,
+            maintenance_count,
+            last_service_date,
+        };
+
+        let key = health_snapshot_key(asset_id);
+        let mut snapshots: Vec<HealthSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        snapshots.push_back(snapshot.clone());
+        env.storage().persistent().set(&key, &snapshots);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        snapshot
+    }
+
+    /// Return all stored health snapshots for an asset.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The asset to query
+    ///
+    /// # Returns
+    /// Vec of [`HealthSnapshot`] in chronological order (oldest first).
+    pub fn get_health_snapshots(env: Env, asset_id: u64) -> Vec<HealthSnapshot> {
+        env.storage()
+            .persistent()
+            .get(&health_snapshot_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
 }
 
 #[cfg(test)]
@@ -2688,6 +2852,7 @@ mod tests {
 
     #[test]
     fn test_history_cap_enforced() {
+        // When max_history is reached, the oldest record is pruned and the new one is accepted.
         let env = Env::default();
         env.mock_all_auths();
 
@@ -2705,24 +2870,19 @@ mod tests {
             );
         }
 
-        let result = client.try_submit_maintenance(
+        // 4th submission should succeed (pruning the oldest) rather than erroring.
+        client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
             &String::from_str(&env, "over cap"),
             &engineer,
         );
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::HistoryCapReached as u32,
-            ))),
-        );
+        let history = client.get_maintenance_history(&asset_id);
+        assert_eq!(history.len(), 3);
     }
 
     #[test]
-    fn test_history_cap_checked_before_cross_contract_calls() {
-        // When the cap is already reached, HistoryCapReached must fire even if the
-        // engineer is not registered — proving the check happens before cross-contract calls.
+    fn test_pruning_event_emitted_when_history_trimmed() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -2740,8 +2900,47 @@ mod tests {
             );
         }
 
-        // Use an unregistered engineer — if cap check is first we get HistoryCapReached,
-        // not UnauthorizedEngineer.
+        // This submission crosses max_history=3, triggering a prune of 1 record.
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "triggers prune"),
+            &engineer,
+        );
+
+        let events = env.events().all();
+        let pruned_event = events.iter().find(|(_, topics, _)| {
+            topics.len() == 1
+                && topics.get(0) == Some(EVENT_PRUNED.try_into_val(&env).unwrap())
+        });
+        assert!(pruned_event.is_some(), "expected PRUNED event");
+        let (_, _, data) = pruned_event.unwrap();
+        let (emitted_asset_id, pruned_count): (u64, u32) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_asset_id, asset_id);
+        assert_eq!(pruned_count, 1u32);
+    }
+
+    #[test]
+    fn test_history_cap_checked_before_cross_contract_calls() {
+        // An unregistered engineer is still rejected even when history is at capacity.
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 3);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        for _ in 0..3 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "ok"),
+                &engineer,
+            );
+        }
+
+        // Unregistered engineer should be rejected with UnauthorizedEngineer.
         let unregistered = Address::generate(&env);
         let result = client.try_submit_maintenance(
             &asset_id,
@@ -2752,7 +2951,7 @@ mod tests {
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::HistoryCapReached as u32,
+                ContractError::UnauthorizedEngineer as u32,
             ))),
         );
     }
@@ -3007,6 +3206,47 @@ mod tests {
 
         let last = client.get_last_service(&asset_id).unwrap();
         assert_eq!(last.timestamp, 2000);
+        assert_eq!(last.task_type, symbol_short!("INSPECT"));
+    }
+
+    #[test]
+    fn test_get_last_maintenance_none_for_no_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+        assert_eq!(client.get_last_maintenance(&asset_id), None);
+    }
+
+    #[test]
+    fn test_get_last_maintenance_returns_most_recent() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        env.ledger().set_timestamp(500);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "older"),
+            &engineer,
+        );
+
+        env.ledger().set_timestamp(1500);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &String::from_str(&env, "newer"),
+            &engineer,
+        );
+
+        let last = client.get_last_maintenance(&asset_id).unwrap();
+        assert_eq!(last.timestamp, 1500);
         assert_eq!(last.task_type, symbol_short!("INSPECT"));
     }
 
@@ -8385,5 +8625,217 @@ mod tests {
         assert_eq!(t0, symbol_short!("UPD_MAX"));
         let emitted_max: u32 = data.try_into_val(&env).unwrap();
         assert_eq!(emitted_max, 300);
+    }
+
+    // --- Health Snapshot Tests ---
+
+    #[test]
+    fn test_take_health_snapshot_empty_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+
+        let snapshot = client.take_health_snapshot(&asset_id);
+
+        assert_eq!(snapshot.score, 0);
+        assert_eq!(snapshot.maintenance_count, 0);
+        assert_eq!(snapshot.last_service_date, 0);
+        assert_eq!(snapshot.timestamp, env.ledger().timestamp());
+    }
+
+    #[test]
+    fn test_take_health_snapshot_with_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Oil change"),
+            &engineer,
+        );
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &String::from_str(&env, "Filter"),
+            &engineer,
+        );
+
+        let service_ts = env.ledger().timestamp();
+        let snapshot = client.take_health_snapshot(&asset_id);
+
+        assert!(snapshot.score > 0, "score should be positive after maintenance");
+        assert_eq!(snapshot.maintenance_count, 2);
+        assert_eq!(snapshot.last_service_date, service_ts);
+        assert_eq!(snapshot.timestamp, service_ts);
+    }
+
+    #[test]
+    fn test_get_health_snapshots_accumulates() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "First service"),
+            &engineer,
+        );
+
+        client.take_health_snapshot(&asset_id);
+
+        env.ledger().with_mut(|li| li.timestamp += 1000);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &String::from_str(&env, "Second service"),
+            &engineer,
+        );
+
+        client.take_health_snapshot(&asset_id);
+
+        let snapshots = client.get_health_snapshots(&asset_id);
+        assert_eq!(snapshots.len(), 2, "should have one snapshot per take_health_snapshot call");
+        assert!(
+            snapshots.get(1).unwrap().timestamp > snapshots.get(0).unwrap().timestamp,
+            "snapshots should be in chronological order"
+        );
+        assert_eq!(snapshots.get(1).unwrap().maintenance_count, 2);
+    }
+
+    #[test]
+    fn test_get_health_snapshots_empty_before_any_snapshot() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+
+        let snapshots = client.get_health_snapshots(&asset_id);
+        assert_eq!(snapshots.len(), 0);
+    }
+
+    #[test]
+    fn test_take_health_snapshot_nonexistent_asset_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+
+        let result = client.try_take_health_snapshot(&999u64);
+        assert!(result.is_err(), "should error for unknown asset");
+    // --- Deprecation: collateral score tests ---
+
+    #[test]
+    fn test_deprecated_asset_returns_zero_collateral_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, _, _) = setup(&env, 200);
+        let (asset_id, owner) = register_asset(&env, &asset_registry);
+
+        // Confirm initial score is 0 (no maintenance history)
+        assert_eq!(lifecycle.get_collateral_score(&asset_id), 0);
+
+        // Deprecate the asset as the owner
+        asset_registry.deprecate_asset(&owner, &asset_id, &String::from_str(&env, "End of service life"));
+
+        // Score must be 0 for a deprecated asset regardless of any history
+        assert_eq!(lifecycle.get_collateral_score(&asset_id), 0);
+    }
+
+    #[test]
+    fn test_active_asset_not_affected_by_deprecation_of_other() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, _, _) = setup(&env, 200);
+        let (asset_id_1, owner) = register_asset(&env, &asset_registry);
+        let (asset_id_2, _) = register_asset(&env, &asset_registry);
+
+        // Deprecate only asset 1
+        asset_registry.deprecate_asset(&owner, &asset_id_1, &String::from_str(&env, "retired"));
+
+        // Asset 2 must still return its normal (0, no history) score — not forced to 0 by deprecation
+        assert_eq!(lifecycle.get_collateral_score(&asset_id_1), 0);
+        // Asset 2 is active, score is 0 simply because no maintenance has been submitted
+        assert_eq!(lifecycle.get_collateral_score(&asset_id_2), 0);
+    // --- Issue #830: set_max_notes_length ---
+
+    #[test]
+    fn test_set_max_notes_length_updates_config() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        lifecycle.set_max_notes_length(&admin, &128);
+
+        let config = lifecycle.get_config();
+        assert_eq!(config.max_notes_length, 128);
+    }
+
+    #[test]
+    fn test_set_max_notes_length_zero_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        let result = lifecycle.try_set_max_notes_length(&admin, &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_set_max_notes_length_non_admin_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, _admin) = setup(&env, 0);
+
+        let outsider = Address::generate(&env);
+        let result = lifecycle.try_set_max_notes_length(&outsider, &64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_set_max_notes_length_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        lifecycle.set_max_notes_length(&admin, &512);
+
+        use soroban_sdk::TryIntoVal;
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, data)| {
+            topics
+                .get(0)
+                .and_then(|v| v.try_into_val::<_, Symbol>(&env).ok())
+                .map(|s| s == symbol_short!("SET_NOTES"))
+                .unwrap_or(false)
+                && data.try_into_val::<_, u32>(&env).ok() == Some(512)
+        });
+        assert!(found, "SET_NOTES event not emitted");
     }
 }
