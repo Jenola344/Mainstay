@@ -36,6 +36,7 @@ pub struct Engineer {
     pub active: bool,
     pub issued_at: u64,
     pub expires_at: u64,
+    pub reputation_score: u32,
 }
 
 #[contracttype]
@@ -271,6 +272,7 @@ impl EngineerRegistry {
             active: true,
             issued_at: now,
             expires_at: now + validity_period,
+            reputation_score: 0,
         };
         env.storage()
             .persistent()
@@ -1033,6 +1035,46 @@ impl EngineerRegistry {
         {
             env.deployer().update_current_contract_wasm(new_wasm_hash);
         }
+    }
+
+    /// Update an engineer's reputation score. Callable only by the lifecycle contract.
+    /// Reputation is clamped to 0–1000.
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer
+    /// * `delta` - Points to add (positive) or subtract (negative)
+    ///
+    /// # Panics
+    /// - [`ContractError::EngineerNotFound`] if the engineer record does not exist
+    pub fn update_reputation(env: Env, engineer: Address, delta: i32) {
+        env.current_contract_address().require_auth();
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+        let new_rep = (record.reputation_score as i64)
+            .saturating_add(delta as i64)
+            .clamp(0, 1000) as u32;
+        record.reputation_score = new_rep;
+        env.storage()
+            .persistent()
+            .set(&engineer_key(&engineer), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Get an engineer's reputation score (0–1000). Returns 0 if not found.
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer
+    pub fn get_reputation(env: Env, engineer: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<_, Engineer>(&engineer_key(&engineer))
+            .map(|e| e.reputation_score)
+            .unwrap_or(0)
     }
 }
 
@@ -3467,5 +3509,105 @@ mod tests {
         env.ledger().with_timestamp(101);
 
         assert!(!client.is_engineer_active(&engineer));
+    }
+
+    #[test]
+    fn test_get_reputation_default_is_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+
+        assert_eq!(client.get_reputation(&engineer), 0);
+    }
+
+    #[test]
+    fn test_update_reputation_increases_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[2u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+
+        client.update_reputation(&engineer, &100);
+        assert_eq!(client.get_reputation(&engineer), 100);
+
+        client.update_reputation(&engineer, &200);
+        assert_eq!(client.get_reputation(&engineer), 300);
+    }
+
+    #[test]
+    fn test_update_reputation_decreases_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[3u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+
+        client.update_reputation(&engineer, &500);
+        client.update_reputation(&engineer, &-200);
+        assert_eq!(client.get_reputation(&engineer), 300);
+    }
+
+    #[test]
+    fn test_update_reputation_clamped_at_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[4u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+
+        // Subtract more than balance — should clamp to 0, not underflow
+        client.update_reputation(&engineer, &-500);
+        assert_eq!(client.get_reputation(&engineer), 0);
+    }
+
+    #[test]
+    fn test_update_reputation_clamped_at_1000() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[5u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+
+        // Add far more than max — should clamp to 1000
+        client.update_reputation(&engineer, &2000);
+        assert_eq!(client.get_reputation(&engineer), 1000);
+    }
+
+    #[test]
+    fn test_get_reputation_returns_zero_for_unknown_engineer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+
+        let unknown = Address::generate(&env);
+        assert_eq!(client.get_reputation(&unknown), 0);
     }
 }
