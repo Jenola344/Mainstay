@@ -81,6 +81,9 @@ const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
 const MIN_VALIDITY_PERIOD: u64 = 86_400;
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
+/// Default grace period allowing engineers to work after credential expiry (7 days).
+const DEFAULT_GRACE_PERIOD_SECS: u64 = 7 * 86_400;
+const GRACE_PERIOD_KEY: Symbol = symbol_short!("GRACE_P");
 const MAX_BATCH_REVOKE: u32 = 50;
 /// Grace period allowing engineers to work after credential expiry (7 days).
 const GRACE_PERIOD_SECS: u64 = 7 * 86_400;
@@ -556,7 +559,7 @@ impl EngineerRegistry {
 
     /// Get the detailed credential status with grace period support.
     /// Distinguishes between valid, in grace period, hard-expired, revoked, and not found.
-    /// Grace period: [`GRACE_PERIOD_SECS`] (7 days) after expiry allows continued operations.
+    /// Grace period is configurable via [`set_grace_period`] (default: 7 days).
     ///
     /// # Arguments
     /// * `engineer` - The address of the engineer to check
@@ -564,6 +567,11 @@ impl EngineerRegistry {
     /// # Returns
     /// A CredentialStatus enum with the detailed credential state
     pub fn get_credential_status(env: Env, engineer: Address) -> CredentialStatus {
+        let grace_period: u64 = env
+            .storage()
+            .persistent()
+            .get(&GRACE_PERIOD_KEY)
+            .unwrap_or(DEFAULT_GRACE_PERIOD_SECS);
         match env
             .storage()
             .persistent()
@@ -576,7 +584,7 @@ impl EngineerRegistry {
                     let now = env.ledger().timestamp();
                     if now < e.expires_at {
                         CredentialStatus::Valid
-                    } else if now < e.expires_at + GRACE_PERIOD_SECS {
+                    } else if now < e.expires_at + grace_period {
                         CredentialStatus::GracePeriod
                     } else {
                         CredentialStatus::HardExpired
@@ -753,6 +761,39 @@ impl EngineerRegistry {
     /// `true` if paused; `false` otherwise
     pub fn is_paused(env: Env) -> bool {
         is_paused(&env)
+    }
+
+    /// Admin-only function to set the configurable grace period for credential renewal.
+    /// After a credential expires, engineers within the grace window still show as
+    /// [`CredentialStatus::GracePeriod`] rather than [`CredentialStatus::HardExpired`].
+    ///
+    /// # Arguments
+    /// * `admin` - The current admin address
+    /// * `secs` - Grace period in seconds (0 disables the grace window entirely)
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    pub fn set_grace_period(env: Env, admin: Address, secs: u64) {
+        admin.require_auth();
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        env.storage().persistent().set(&GRACE_PERIOD_KEY, &secs);
+        env.storage()
+            .persistent()
+            .extend_ttl(&GRACE_PERIOD_KEY, TTL_THRESHOLD, TTL_TARGET);
+        env.events()
+            .publish((symbol_short!("ADM_AUD"), symbol_short!("SET_GRACE")), (admin, secs));
+    }
+
+    /// Returns the current grace period in seconds.
+    /// If never set by admin, returns the default (7 days = 604_800 seconds).
+    pub fn get_grace_period(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&GRACE_PERIOD_KEY)
+            .unwrap_or(DEFAULT_GRACE_PERIOD_SECS)
     }
 
     /// Check if an issuer is in the trusted issuers list.
@@ -3346,6 +3387,60 @@ mod tests {
 
         let record = client.get_engineer(&engineer);
         assert!(record.expires_at > env.ledger().timestamp());
+    }
+
+    #[test]
+    fn test_get_grace_period_returns_default() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+        // Default is 7 days = 604_800 seconds
+        assert_eq!(client.get_grace_period(), 7 * 86_400u64);
+    }
+
+    #[test]
+    fn test_set_grace_period_updates_credential_status() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        let base_time = env.ledger().timestamp();
+        let validity = 86_400u64;
+        client.register_engineer(&engineer, &hash, &issuer, &validity);
+
+        // Shrink grace period to 1 hour
+        client.set_grace_period(&admin, &3_600u64);
+        assert_eq!(client.get_grace_period(), 3_600u64);
+
+        // 2 hours after expiry → past 1h grace period → HardExpired
+        env.ledger().set_timestamp(base_time + validity + 7_200);
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::HardExpired
+        );
+
+        // Within 1h grace period → GracePeriod
+        env.ledger().set_timestamp(base_time + validity + 1_800);
+        assert_eq!(
+            client.get_credential_status(&engineer),
+            CredentialStatus::GracePeriod
+        );
+    }
+
+    #[test]
+    fn test_set_grace_period_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+
+        let non_admin = Address::generate(&env);
+        let result = client.try_set_grace_period(&non_admin, &3_600u64);
+        assert!(result.is_err());
     }
 
     // --- Issue: batch_verify_engineers ---
