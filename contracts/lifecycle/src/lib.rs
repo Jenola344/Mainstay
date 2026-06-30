@@ -9584,6 +9584,21 @@ mod tests {
         assert!(found, "SET_NOTES event not emitted");
     }
 
+    /// An engineer whose credential has passed both the expiry date **and** the
+    /// grace period (i.e. `CredentialStatus::HardExpired`) must not be allowed
+    /// to submit a maintenance record.
+    ///
+    /// Setup:
+    ///   1. Register an engineer with a 1-day validity period (`86_400` s).
+    ///   2. Authorize that engineer for the asset so the per-asset authorisation
+    ///      check does not fire first.
+    ///   3. Advance the ledger past `expires_at + grace_period` (7 days =
+    ///      `604_800` s), landing firmly in `HardExpired` territory.
+    ///   4. Confirm the registry reports `HardExpired`.
+    ///   5. Assert that `try_submit_maintenance` returns
+    ///      `ContractError::UnauthorizedEngineer`.
+    #[test]
+    fn test_hard_expired_credential_cannot_submit_maintenance() {
     // ── #794 regression ──────────────────────────────────────────────────────
     // A decommissioned asset must return a collateral score of 0 regardless of
     // how many maintenance records it accumulated before decommission.
@@ -9661,6 +9676,67 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+
+        // ── 1. Register an asset ──────────────────────────────────────────────
+        let owner = Address::generate(&env);
+        let asset_id = asset_registry_client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Cummins QSK60"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        // ── 2. Register engineer with a short (1-day) validity period ─────────
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let eng_admin = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[2u8; 32]);
+        engineer_registry_client.initialize_admin(&eng_admin, &eng_admin);
+        engineer_registry_client.add_trusted_issuer(&eng_admin, &issuer);
+        // validity_period = 86_400 s (1 day — the minimum allowed)
+        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400);
+
+        // Confirm credential is Valid before we advance time.
+        assert_eq!(
+            engineer_registry_client.get_credential_status(&engineer),
+            engineer_registry::CredentialStatus::Valid,
+            "credential should be Valid immediately after registration"
+        );
+
+        // ── 3. Authorize the engineer for the asset so the per-asset check
+        //       does not mask the credential-expiry check. ─────────────────────
+        client.authorize_engineer(&owner, &asset_id, &engineer);
+
+        // ── 4. Advance ledger past expires_at + grace_period (7 × 86_400 s)
+        //       to land in HardExpired territory.
+        //       Total offset: 86_400 (validity) + 604_800 (grace) + 1 = 691_201 s
+        let base_timestamp = env.ledger().timestamp();
+        env.ledger()
+            .set_timestamp(base_timestamp + 86_400 + 604_800 + 1);
+
+        // Sanity-check: the registry must report HardExpired at this point.
+        assert_eq!(
+            engineer_registry_client.get_credential_status(&engineer),
+            engineer_registry::CredentialStatus::HardExpired,
+            "credential should be HardExpired after expiry + grace period"
+        );
+
+        // ── 5. Attempt to submit maintenance — must be rejected ───────────────
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Post-hard-expiry maintenance attempt"),
+            &engineer,
+        );
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedEngineer as u32,
+            ))),
+            "HardExpired engineer must not be able to submit maintenance"
+        );
+    }
         let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
