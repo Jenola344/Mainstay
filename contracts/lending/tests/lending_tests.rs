@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use lending::{LendingContract, LendingContractClient, ContractError, LoanStatus};
+use lending::{ContractError, LendingContract, LendingContractClient, LoanStatus};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
@@ -100,7 +100,10 @@ fn test_insufficient_contract_balance_rejection() {
         client.request_loan(&borrower, &100);
     }));
 
-    assert!(result.is_err(), "Loan request with insufficient contract balance should fail");
+    assert!(
+        result.is_err(),
+        "Loan request with insufficient contract balance should fail"
+    );
 }
 
 #[test]
@@ -161,7 +164,10 @@ fn test_withdraw_vouch_with_active_loan_rejection() {
         client.withdraw_vouch(&borrower, &voucher);
     }));
 
-    assert!(result.is_err(), "Withdraw vouch with active loan should fail");
+    assert!(
+        result.is_err(),
+        "Withdraw vouch with active loan should fail"
+    );
 }
 
 #[test]

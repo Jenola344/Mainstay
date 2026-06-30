@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `.github/CODEOWNERS`: required-reviewer rules gate all PRs touching `contracts/`, CI workflows, `SECURITY.md`, and the threat-model doc (closes [#781](https://github.com/TwinTrustMainstay/Mainstay/issues/781))
+- `CONTRIBUTING.md`: documented branch-protection requirements (1 approval + passing CI, no force-push) and the CODEOWNERS review expectation for `contracts/` (closes [#781](https://github.com/TwinTrustMainstay/Mainstay/issues/781))
+- `test_cross_owner_duplicate_serial_rejected` in `asset-registry`: verifies that the global serial-number dedup key blocks a second owner from registering the same physical machine (closes [#782](https://github.com/TwinTrustMainstay/Mainstay/issues/782))
+- `test_decay_score_never_drops_to_zero_with_history` in `lifecycle`: verifies that calling `decay_score` on an asset with maintenance records never stores or returns 0 (closes [#784](https://github.com/TwinTrustMainstay/Mainstay/issues/784))
+
+### Fixed
+- `apply_decay` in `lifecycle/src/scoring.rs`: enforce `MIN_SCORE_WITH_HISTORY = 1` in both the main decay path and the early-return path so the stored score is never written as 0 for an asset that has at least one maintenance record (closes [#784](https://github.com/TwinTrustMainstay/Mainstay/issues/784))
+
+### Security
+- `initialize_admin` in `asset-registry` already required `deployer.require_auth()`, preventing front-run attacks; the existing `test_initialize_admin_rejects_non_deployer` test and deployment-runbook section 3 now explicitly document this protection (closes [#783](https://github.com/TwinTrustMainstay/Mainstay/issues/783))
+
 ## [1.0.0] - 2026-06-02
 
 ### Added
