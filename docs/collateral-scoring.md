@@ -158,6 +158,73 @@ All scoring parameters are configurable by contract administrators:
 - **Parameters**: `offset` (start index), `limit` (max records)
 - **Use Case**: UI display of large histories
 
+## Worked Example: Generator with 12 Months of Maintenance
+
+The table below walks through a realistic generator maintenance schedule over roughly 12 months using the documented defaults:
+
+- `decay_rate = 5`
+- `decay_interval = 30 days`
+- `eligibility_threshold = 50`
+- task weights: minor = 2, medium = 5, major = 10
+
+Assumption: the score is checked immediately before each maintenance event, so any elapsed-time decay is applied first and the new maintenance points are then added.
+
+| Event | Approx. date | Task | Weight | Days since prior event | Decay applied before event | Score after decay | Score after event |
+|------:|--------------|------|-------:|-----------------------:|---------------------------:|------------------:|------------------:|
+| 1 | Jan 1 | `ENGINE` | 10 | — | 0 | 0 | 10 |
+| 2 | Jan 21 | `FILTER` | 5 | 20 | `floor(20 / 30) * 5 = 0` | 10 | 15 |
+| 3 | Feb 20 | `BRAKE` | 5 | 30 | `floor(30 / 30) * 5 = 5` | 10 | 15 |
+| 4 | Mar 12 | `OVERHAUL` | 10 | 20 | `floor(20 / 30) * 5 = 0` | 15 | 25 |
+| 5 | Apr 11 | `FILTER` | 5 | 30 | `floor(30 / 30) * 5 = 5` | 20 | 25 |
+| 6 | May 1 | `TUNE_UP` | 5 | 20 | `floor(20 / 30) * 5 = 0` | 25 | 30 |
+| 7 | May 31 | `ENGINE` | 10 | 30 | `floor(30 / 30) * 5 = 5` | 25 | 35 |
+| 8 | Jun 20 | `FILTER` | 5 | 20 | `floor(20 / 30) * 5 = 0` | 35 | 40 |
+| 9 | Jul 20 | `BRAKE` | 5 | 30 | `floor(30 / 30) * 5 = 5` | 35 | 40 |
+| 10 | Aug 19 | `OVERHAUL` | 10 | 30 | `floor(30 / 30) * 5 = 5` | 35 | 45 |
+| 11 | Sep 8 | `FILTER` | 5 | 20 | `floor(20 / 30) * 5 = 0` | 45 | 50 |
+| 12 | Oct 8 | `REBUILD` | 10 | 30 | `floor(30 / 30) * 5 = 5` | 45 | 55 |
+
+### Step-by-step interpretation
+
+1. The first major service starts the generator at **10**.
+2. Short 20-day gaps do **not** trigger decay because decay uses whole 30-day intervals.
+3. Each 30-day gap removes **5** points before the next event is applied.
+4. Repeated medium and major maintenance steadily offsets decay and pushes the score upward.
+5. After event 11, the generator reaches the default eligibility threshold exactly: **50**.
+6. After event 12, the score rises to **55**, so the asset is above the threshold.
+
+### Collateral eligibility determination
+
+Using the default rule:
+
+```text
+is_eligible = current_score >= 50
+```
+
+Immediately after the final `REBUILD` event:
+
+```text
+current_score = 55
+eligibility_threshold = 50
+55 >= 50 => eligible
+```
+
+If no new maintenance is recorded for the next 60 days, decay is applied again:
+
+```text
+elapsed_time = 60 days
+decay_intervals = floor(60 / 30) = 2
+total_decay = 2 * 5 = 10
+new_score = 55 - 10 = 45
+45 >= 50 => not eligible
+```
+
+This illustrates the intended behavior of the model:
+
+- maintenance events increase the score,
+- inactivity causes the score to decay in discrete steps, and
+- collateral eligibility depends on the score **at the time of the check**, not just on historical maintenance volume.
+
 ## Score Examples
 
 ### Example 1: New Generator

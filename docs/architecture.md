@@ -86,33 +86,20 @@ The orchestration contract. Binds AssetRegistry and EngineerRegistry together to
 
 ## Cross-Contract Call Flow
 
-The Lifecycle contract calls into the other two contracts on every maintenance submission. Neither AssetRegistry nor EngineerRegistry calls any other contract.
+The Lifecycle contract acts as the main orchestrator and is the only contract that initiates cross-contract calls. Neither `AssetRegistry` nor `EngineerRegistry` calls any other contract.
 
-```
-Engineer (caller)
-      │
-      │  submit_maintenance(asset_id, task_type, notes, engineer)
-      ▼
-┌─────────────────────────────────────────────────────────┐
-│                     Lifecycle                           │
-│                                                         │
-│  1. engineer.require_auth()                             │
-│                                                         │
-│  2. ──► AssetRegistry::get_asset(asset_id)              │
-│         • Panics with AssetNotFound if unknown          │
-│                                                         │
-│  3. ──► EngineerRegistry::verify_engineer(engineer)     │
-│         • Returns false if inactive or expired          │
-│         • Panics with UnauthorizedEngineer if false     │
-│                                                         │
-│  4. Append MaintenanceRecord to history                 │
-│  5. Recalculate and persist collateral score            │
-│  6. Append ScoreEntry snapshot                          │
-│  7. Emit maintenance event                              │
-└─────────────────────────────────────────────────────────┘
-```
+### Cross-Contract Call Mapping
 
-`batch_submit_maintenance` follows the same flow but validates all records fit within `max_history` before writing any of them.
+| Calling Contract | Calling Function | Target Contract | Target Function | Purpose |
+|------------------|-------------------|-----------------|-----------------|---------|
+| `Lifecycle` | `submit_maintenance` / `batch_submit_maintenance` | `AssetRegistry` | `try_get_asset` | Verifies that the asset exists. Panics with `AssetNotFound` if it does not. |
+| `Lifecycle` | `submit_maintenance` / `batch_submit_maintenance` | `EngineerRegistry` | `get_credential_status` | Retrieves the engineer's credential status. |
+| `Lifecycle` | `submit_maintenance` / `batch_submit_maintenance` | `EngineerRegistry` | `verify_engineer` | Fallback check called if the status from `get_credential_status` is not `Valid` or `GracePeriod`. Panics with `UnauthorizedEngineer` if verification fails. |
+| `Lifecycle` | `submit_maintenance` / `batch_submit_maintenance` | `EngineerRegistry` | `get_reputation` | Fetches the engineer's reputation score to weight the collateral score increment. |
+| `Lifecycle` | `record_transfer` | `AssetRegistry` | `try_get_asset` | Verifies that the asset exists. |
+| `Lifecycle` | `record_transfer` | `AssetRegistry` | `get_asset` | Fetches the asset to verify that the `new_owner` matches the current owner in the registry. Panics with `UnauthorizedOwner` if they do not match. |
+| `Lifecycle` | `get_collateral_score` / `get_collateral_score_batch` | `AssetRegistry` | `try_get_asset` | Verifies that the asset exists. |
+| `Lifecycle` | `get_collateral_score` / `get_collateral_score_batch` | `AssetRegistry` | `get_asset` | Fetches the asset to verify that its deprecation status is `Active` (deprecated assets return `0` immediately). |
 
 ---
 
@@ -130,32 +117,73 @@ sequenceDiagram
 ```
 
 ### Maintenance Submission Flow
+
+The full sequence for `submit_maintenance`. The Lifecycle contract validates the
+task type and notes length locally before making any cross-contract calls to
+avoid wasting gas on invalid inputs.
+
 ```mermaid
 sequenceDiagram
-    participant Engineer
+    autonumber
+    actor Engineer
     participant Lifecycle
     participant AssetRegistry
     participant EngineerRegistry
-    Engineer->>Lifecycle: submit_maintenance(asset_id, task_type, notes)
+
+    Engineer->>Lifecycle: submit_maintenance(asset_id, task_type, notes, engineer)
+    Note over Lifecycle: engineer.require_auth()
+    Note over Lifecycle: validate task_type weight and notes length (local, no cross-call)
+
     Lifecycle->>AssetRegistry: get_asset(asset_id)
-    AssetRegistry-->>Lifecycle: return asset record
-    Lifecycle->>EngineerRegistry: verify_engineer(engineer_id)
-    EngineerRegistry-->>Lifecycle: verification result
-    Lifecycle->>Lifecycle: append maintenance record and update score
-    Lifecycle-->>Engineer: emit maintenance event
+    AssetRegistry-->>Lifecycle: Asset { owner, asset_type, deprecation_status, … }
+    Note over Lifecycle: panic AssetNotFound if unknown
+
+    Lifecycle->>EngineerRegistry: get_credential_status(engineer)
+    EngineerRegistry-->>Lifecycle: CredentialStatus (Valid | GracePeriod | HardExpired | Revoked)
+    Note over Lifecycle: panic UnauthorizedEngineer if not Valid or GracePeriod
+
+    Note over Lifecycle: require_engineer_authorized(asset_id, engineer)<br/>reads ENG_AUTH key — panic EngineerNotAuthorized if false
+
+    Lifecycle->>EngineerRegistry: get_reputation(engineer)
+    EngineerRegistry-->>Lifecycle: reputation_score (0–1000)
+
+    Note over Lifecycle: weighted_increment = score_increment × (500 + reputation) / 1000<br/>new_score = min(stored_score + weighted_increment, 100)<br/>Append MaintenanceRecord to HIST<br/>Push ScoreEntry to SCHIST<br/>Write SCORE and LUPD<br/>Update ENG_HIST
+
+    Lifecycle-->>Engineer: emit (maint, asset_id, engineer, task_type, timestamp)
 ```
 
-### DeFi Collateral Query Flow
+### Collateral Score Query Flow (with Lazy Decay)
+
+`get_collateral_score` is read-only from the caller's perspective but applies
+lazy decay internally and writes the result back so subsequent calls stay
+consistent. Two independent scoring models run in parallel; the lower value wins.
+
 ```mermaid
 sequenceDiagram
-    participant Borrower
+    autonumber
+    actor Caller
     participant Lifecycle
     participant AssetRegistry
-    Borrower->>Lifecycle: get_collateral_score(asset_id)
+
+    Caller->>Lifecycle: get_collateral_score(asset_id)
+
     Lifecycle->>AssetRegistry: get_asset(asset_id)
-    AssetRegistry-->>Lifecycle: return asset record
-    Lifecycle->>Lifecycle: read score and trend history
-    Lifecycle-->>Borrower: return collateral_score
+    AssetRegistry-->>Lifecycle: Asset { deprecation_status, … }
+    Note over Lifecycle: return 0 immediately if asset is Deprecated or Decommissioned
+
+    Note over Lifecycle: if FROZEN key is set → return FRZ_SCR (score captured at decommission)
+
+    Note over Lifecycle: — Model A: recency-weighted history score —<br/>Read HIST (Vec&lt;MaintenanceRecord&gt;)<br/>For each record:<br/>  age_ledgers = current_ledger − record_ledger<br/>  recency_weight = max(0, MAX_AGE_LEDGERS − age_ledgers)<br/>  contribution = score_increment × recency_weight / MAX_AGE_LEDGERS<br/>history_score = min(Σ contributions, 100)
+
+    Note over Lifecycle: — Model B: stored score with lazy config decay —<br/>Read SCORE (stored accumulated value)<br/>Read LUPD (timestamp of last write)<br/>elapsed = current_time − last_update<br/>decay_intervals = elapsed / decay_interval<br/>config_score = max(0, stored − decay_intervals × decay_rate)
+
+    Note over Lifecycle: score = min(history_score, config_score)
+
+    Note over Lifecycle: — Floor —<br/>if HIST is non-empty and score &lt; 1:<br/>  score = 1  (MIN_SCORE_WITH_HISTORY)
+
+    Note over Lifecycle: Persist score → SCORE<br/>Persist current timestamp → LUPD
+
+    Lifecycle-->>Caller: return score (0–100)
 ```
 
 ---
