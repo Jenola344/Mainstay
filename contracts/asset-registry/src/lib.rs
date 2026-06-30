@@ -33,7 +33,7 @@ pub enum ContractError {
     /// Asset has already been deprecated and cannot be deprecated again.
     AssetAlreadyDeprecated = 17,
     /// The batch exceeds the maximum allowed size.
-    BatchTooLarge = 17,
+    BatchTooLarge = 18,
 }
 
 #[contracttype]
@@ -1486,7 +1486,7 @@ impl AssetRegistry {
             .extend_ttl(&reason_key, TTL_THRESHOLD, TTL_TARGET);
 
         env.events().publish(
-            (symbol_short!("DEPRECATED"), asset_id),
+            (symbol_short!("DEPR"), asset_id),
             (owner, reason, env.ledger().timestamp()),
         );
     }

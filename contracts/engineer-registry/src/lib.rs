@@ -3748,7 +3748,13 @@ mod tests {
 
     #[test]
     fn test_get_reputation_default_is_zero() {
-    // --- Issue #827: get_total_engineer_count ---
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        assert_eq!(client.get_reputation(&engineer), 0);
+    }
 
     #[test]
     fn test_get_total_engineer_count_returns_u64() {
@@ -3763,12 +3769,14 @@ mod tests {
         client.add_trusted_issuer(&admin, &issuer);
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
 
-        assert_eq!(client.get_reputation(&engineer), 0);
+        assert_eq!(client.get_total_engineer_count(), 1u64);
     }
 
     #[test]
     fn test_update_reputation_increases_score() {
-        assert_eq!(client.get_total_engineer_count(), 0u64);
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
 
         let issuer = Address::generate(&env);
         client.add_trusted_issuer(&admin, &issuer);
@@ -3778,163 +3786,60 @@ mod tests {
         client.register_engineer(&e1, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000, &None);
         client.register_engineer(&e2, &BytesN::from_array(&env, &[2u8; 32]), &issuer, &31_536_000, &None);
 
-        assert_eq!(client.get_total_engineer_count(), 2u64);
-    }
+        client.update_reputation(&e1, &100);
+        client.update_reputation(&e2, &50);
 
-    // --- Issue #828: batch_revoke_credentials ---
-
-    #[test]
-    fn test_batch_revoke_credentials_revokes_active_engineers() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-
-        let engineer = Address::generate(&env);
-        let issuer = Address::generate(&env);
-        let hash = BytesN::from_array(&env, &[2u8; 32]);
-
-        client.add_trusted_issuer(&admin, &issuer);
-        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
-
-        client.update_reputation(&engineer, &100);
-        assert_eq!(client.get_reputation(&engineer), 100);
-
-        client.update_reputation(&engineer, &200);
-        assert_eq!(client.get_reputation(&engineer), 300);
+        assert_eq!(client.get_reputation(&e1), 100);
+        assert_eq!(client.get_reputation(&e2), 50);
     }
 
     #[test]
     fn test_update_reputation_decreases_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
         let issuer = Address::generate(&env);
         client.add_trusted_issuer(&admin, &issuer);
 
         let e1 = Address::generate(&env);
-        let e2 = Address::generate(&env);
         client.register_engineer(&e1, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000, &None);
-        client.register_engineer(&e2, &BytesN::from_array(&env, &[2u8; 32]), &issuer, &31_536_000, &None);
 
-        let mut batch = Vec::new(&env);
-        batch.push_back(e1.clone());
-        batch.push_back(e2.clone());
-        client.batch_revoke_credentials(&admin, &batch);
+        client.update_reputation(&e1, &100);
+        client.update_reputation(&e1, &-50);
 
-        assert_eq!(client.get_engineer_status(&e1), EngineerStatus::Revoked);
-        assert_eq!(client.get_engineer_status(&e2), EngineerStatus::Revoked);
-    }
-
-    #[test]
-    fn test_batch_revoke_credentials_exceeds_max_returns_error() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, admin) = setup(&env);
-
-        let engineer = Address::generate(&env);
-        let issuer = Address::generate(&env);
-        let hash = BytesN::from_array(&env, &[3u8; 32]);
-
-        client.add_trusted_issuer(&admin, &issuer);
-        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
-
-        client.update_reputation(&engineer, &500);
-        client.update_reputation(&engineer, &-200);
-        assert_eq!(client.get_reputation(&engineer), 300);
+        assert_eq!(client.get_reputation(&e1), 50);
     }
 
     #[test]
     fn test_update_reputation_clamped_at_zero() {
-        let mut batch = Vec::new(&env);
-        for _ in 0..=50u32 {
-            batch.push_back(Address::generate(&env));
-        }
-
-        let result = client.try_batch_revoke_credentials(&admin, &batch);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::BatchRevokeTooLarge as u32,
-            ))),
-        );
-    }
-
-    #[test]
-    fn test_batch_revoke_credentials_non_admin_fails() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _admin) = setup(&env);
-
-        let outsider = Address::generate(&env);
-        let batch = Vec::new(&env);
-        let result = client.try_batch_revoke_credentials(&outsider, &batch);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::UnauthorizedAdmin as u32,
-            ))),
-        );
-    }
-
-    #[test]
-    fn test_batch_revoke_emits_event_per_engineer() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
 
-        let engineer = Address::generate(&env);
         let issuer = Address::generate(&env);
-        let hash = BytesN::from_array(&env, &[4u8; 32]);
-
         client.add_trusted_issuer(&admin, &issuer);
-        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
 
-        // Subtract more than balance — should clamp to 0, not underflow
+        let engineer = Address::generate(&env);
+        client.register_engineer(&engineer, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000, &None);
         client.update_reputation(&engineer, &-500);
+
         assert_eq!(client.get_reputation(&engineer), 0);
     }
 
     #[test]
     fn test_update_reputation_clamped_at_1000() {
-        let issuer = Address::generate(&env);
-        client.add_trusted_issuer(&admin, &issuer);
-
-        let e1 = Address::generate(&env);
-        client.register_engineer(&e1, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000, &None);
-
-        let mut batch = Vec::new(&env);
-        batch.push_back(e1.clone());
-        client.batch_revoke_credentials(&admin, &batch);
-
-        let events = env.events().all();
-        let revoke_events: Vec<_> = events
-            .iter()
-            .filter(|(_, topics, _)| {
-                use soroban_sdk::TryIntoVal;
-                topics
-                    .get(0)
-                    .and_then(|v| v.try_into_val::<_, Symbol>(&env).ok())
-                    .map(|s| s == symbol_short!("REV_CRED"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        assert!(!revoke_events.is_empty(), "Should emit REV_CRED event per engineer");
-    }
-
-    // --- Issue #829: notes field on Engineer ---
-
-    #[test]
-    fn test_register_engineer_with_notes() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
 
-        let engineer = Address::generate(&env);
         let issuer = Address::generate(&env);
-        let hash = BytesN::from_array(&env, &[5u8; 32]);
-
         client.add_trusted_issuer(&admin, &issuer);
-        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
 
-        // Add far more than max — should clamp to 1000
+        let engineer = Address::generate(&env);
+        client.register_engineer(&engineer, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000, &None);
         client.update_reputation(&engineer, &2000);
+
         assert_eq!(client.get_reputation(&engineer), 1000);
     }
 
@@ -3946,13 +3851,20 @@ mod tests {
 
         let unknown = Address::generate(&env);
         assert_eq!(client.get_reputation(&unknown), 0);
-        let issuer = Address::generate(&env);
-        client.add_trusted_issuer(&admin, &issuer);
+    }
+
+    #[test]
+    fn test_register_engineer_with_notes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
 
         let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
         let hash = BytesN::from_array(&env, &[5u8; 32]);
         let notes = Some(String::from_str(&env, "Certified: High-Voltage Generators"));
 
+        client.add_trusted_issuer(&admin, &issuer);
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &notes);
 
         let record = client.get_engineer(&engineer);
