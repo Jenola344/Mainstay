@@ -67,6 +67,19 @@ pub struct Asset {
     pub owner: Address,
     pub registered_at: u64,
     pub metadata_updated_at: u64,
+    /// Incremented on every successful call to `update_asset_metadata`.
+    /// Starts at 0 when the asset is first registered.
+    pub metadata_version: u32,
+}
+
+/// A single entry in the metadata change history for an asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataHistoryEntry {
+    pub version: u32,
+    pub old_hash: BytesN<32>,
+    pub new_hash: BytesN<32>,
+    pub updated_at: u64,
     /// Soft lifecycle status set by the owner. Defaults to `Active` on registration.
     pub deprecation_status: DeprecationStatus,
 }
@@ -190,6 +203,10 @@ pub const RM_TYPE_TOPIC: Symbol = symbol_short!("RM_TYPE");
 
 fn asset_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("ASSET"), id)
+}
+
+fn metadata_history_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("META_HIS"), asset_id)
 }
 
 fn timelock_key(op: Symbol, asset_id: u64) -> (Symbol, Symbol, u64) {
@@ -608,6 +625,7 @@ impl AssetRegistry {
             owner: owner.clone(),
             registered_at: env.ledger().timestamp(),
             metadata_updated_at: env.ledger().timestamp(),
+            metadata_version: 0,
             deprecation_status: DeprecationStatus::Active,
         };
         env.storage().persistent().set(&asset_key(id), &asset);
@@ -720,6 +738,7 @@ impl AssetRegistry {
                 owner: owner.clone(),
                 registered_at: env.ledger().timestamp(),
                 metadata_updated_at: env.ledger().timestamp(),
+                metadata_version: 0,
                 deprecation_status: DeprecationStatus::Active,
             };
 
@@ -1446,18 +1465,66 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::DuplicateAsset);
         }
 
+        // Append history entry before updating the asset
+        let history_key = metadata_history_key(asset_id);
+        let mut history: Vec<MetadataHistoryEntry> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let new_version = asset.metadata_version + 1;
+        history.push_back(MetadataHistoryEntry {
+            version: new_version,
+            old_hash: old_hash.clone(),
+            new_hash: new_hash.clone(),
+            updated_at: env.ledger().timestamp(),
+        });
+        env.storage().persistent().set(&history_key, &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&history_key, TTL_THRESHOLD, TTL_TARGET);
+
         // Store new dedup key and updated asset
         env.storage().persistent().set(&new_dk, &asset_id);
         extend_persistent_ttl(&env, &new_dk);
         asset.metadata = new_metadata.clone();
         asset.metadata_updated_at = env.ledger().timestamp();
+        asset.metadata_version = new_version;
         env.storage().persistent().set(&asset_key(asset_id), &asset);
         extend_persistent_ttl(&env, &asset_key(asset_id));
 
         env.events().publish(
             (symbol_short!("UPD_META"), asset_id),
-            (owner, new_metadata, env.ledger().timestamp()),
+            (owner, old_hash, new_hash, new_version, env.ledger().timestamp()),
         );
+    }
+
+    /// Returns the full metadata change history for an asset, ordered oldest-first.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// `Vec<MetadataHistoryEntry>` — empty if no updates have been made
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn get_metadata_history(env: Env, asset_id: u64) -> Vec<MetadataHistoryEntry> {
+        if !Self::asset_exists(env.clone(), asset_id) {
+            panic_with_error!(&env, ContractError::AssetNotFound);
+        }
+        let key = metadata_history_key(asset_id);
+        let history: Vec<MetadataHistoryEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        }
+        history
     }
 
     /// Transfer ownership of an asset from the current owner to a new owner.
@@ -2772,6 +2839,182 @@ mod tests {
                 ContractError::AssetNotFound as u32,
             ))),
         );
+    }
+
+    #[test]
+    fn test_metadata_version_starts_at_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Original spec"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let asset = client.get_asset(&id);
+        assert_eq!(asset.metadata_version, 0);
+    }
+
+    #[test]
+    fn test_metadata_version_increments_on_update() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Original spec"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "Spec v2"));
+        assert_eq!(client.get_asset(&id).metadata_version, 1);
+
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "Spec v3"));
+        assert_eq!(client.get_asset(&id).metadata_version, 2);
+    }
+
+    #[test]
+    fn test_get_metadata_history_returns_entries() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let original = String::from_str(&env, "Original spec");
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &original,
+            &unique_serial(&env),
+            &owner,
+        );
+
+        // No history before any update
+        assert_eq!(client.get_metadata_history(&id).len(), 0);
+
+        let v2 = String::from_str(&env, "Spec v2");
+        client.update_asset_metadata(&id, &owner, &v2);
+
+        let history = client.get_metadata_history(&id);
+        assert_eq!(history.len(), 1);
+
+        let entry = history.get(0).unwrap();
+        assert_eq!(entry.version, 1);
+
+        // Verify old_hash matches sha256 of original metadata XDR
+        let expected_old_hash: BytesN<32> = env.crypto().sha256(&original.to_xdr(&env)).into();
+        let expected_new_hash: BytesN<32> = env.crypto().sha256(&v2.to_xdr(&env)).into();
+        assert_eq!(entry.old_hash, expected_old_hash);
+        assert_eq!(entry.new_hash, expected_new_hash);
+    }
+
+    #[test]
+    fn test_get_metadata_history_multiple_updates() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "v1"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "v2"));
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "v3"));
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "v4"));
+
+        let history = client.get_metadata_history(&id);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history.get(0).unwrap().version, 1);
+        assert_eq!(history.get(1).unwrap().version, 2);
+        assert_eq!(history.get(2).unwrap().version, 3);
+    }
+
+    #[test]
+    fn test_get_metadata_history_nonexistent_asset_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let result = client.try_get_metadata_history(&999u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_update_metadata_event_contains_hashes_and_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let original = String::from_str(&env, "Original spec");
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &original,
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let new_meta = String::from_str(&env, "Repowered spec");
+        let ts = env.ledger().timestamp();
+        client.update_asset_metadata(&id, &owner, &new_meta);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+
+        let (_, topics, data) = events.last().unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("UPD_META"));
+
+        let (_, old_hash, new_hash, version, _timestamp): (Address, BytesN<32>, BytesN<32>, u32, u64) =
+            data.try_into_val(&env).unwrap();
+
+        let expected_old: BytesN<32> = env.crypto().sha256(&original.to_xdr(&env)).into();
+        let expected_new: BytesN<32> = env.crypto().sha256(&new_meta.to_xdr(&env)).into();
+        assert_eq!(old_hash, expected_old);
+        assert_eq!(new_hash, expected_new);
+        assert_eq!(version, 1u32);
+        let _ = ts; // timestamp checked separately if needed
     }
 
     #[test]
