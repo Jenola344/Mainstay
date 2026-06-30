@@ -1,10 +1,7 @@
 #![cfg(test)]
 
 use lending::{LendingContract, LendingContractClient};
-use soroban_sdk::{
-    testutils::Address as _,
-    token, Address, Env,
-};
+use soroban_sdk::{testutils::Address as _, token, Address, Env};
 
 fn setup_contract(env: &Env) -> (LendingContractClient, Address, Address) {
     let contract_id = env.register(LendingContract, ());
@@ -17,7 +14,7 @@ fn setup_contract(env: &Env) -> (LendingContractClient, Address, Address) {
     let token_id = env.register_stellar_asset_contract(token_admin.clone());
 
     env.mock_all_auths();
-    client.initialize(&deployer, &admin, &token_id);
+    client.initialize(&deployer, &admin, &token_id, &0);
 
     (client, token_id, contract_id)
 }
