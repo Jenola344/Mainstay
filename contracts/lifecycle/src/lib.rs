@@ -1110,6 +1110,56 @@ impl Lifecycle {
         );
     }
 
+    /// Admin-only function to set the minimum lifecycle score required for collateral eligibility.
+    /// Different DeFi lenders may require different minimum scores; this allows post-deploy configuration.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `value` - The new eligibility threshold (must be > 0)
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::InvalidConfig`] if value is 0
+    pub fn set_eligibility_threshold(env: Env, admin: Address, value: u32) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        if value == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+
+        let mut config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        let old_threshold = config.eligibility_threshold;
+        config.eligibility_threshold = value;
+        env.storage().persistent().set(&CONFIG, &config);
+        env.storage()
+            .persistent()
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("SET_ELIG"), admin.clone()),
+            (old_threshold, value),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
+            (
+                admin,
+                env.ledger().timestamp(),
+                symbol_short!("ELIG_THR"),
+                value,
+            ),
+        );
+    }
+
     /// Admin-only function to set a custom weight for a specific task type.
     /// Allows per-task-type score increment configuration. Falls back to defaults if not set.
     ///
@@ -9464,6 +9514,8 @@ mod tests {
         assert!(found, "SET_NOTES event not emitted");
     }
 
+    #[test]
+    fn test_set_eligibility_threshold_updates_config() {
     // --- Issue #770 ---
 
     #[test]
@@ -9585,6 +9637,17 @@ mod tests {
         env.mock_all_auths();
         let (lifecycle, _, _, admin) = setup(&env, 0);
 
+        let initial = lifecycle.get_config().eligibility_threshold;
+        assert_eq!(initial, DEFAULT_ELIGIBILITY_THRESHOLD);
+
+        lifecycle.set_eligibility_threshold(&admin, &75);
+
+        let config = lifecycle.get_config();
+        assert_eq!(config.eligibility_threshold, 75);
+    }
+
+    #[test]
+    fn test_set_eligibility_threshold_zero_rejected() {
         // Default config has admins=[] and threshold=0 → single-admin mode
         let config = lifecycle.get_config();
         assert_eq!(config.admins.len(), 0);
@@ -9618,6 +9681,7 @@ mod tests {
         env.mock_all_auths();
         let (lifecycle, _, _, admin) = setup(&env, 0);
 
+        let result = lifecycle.try_set_eligibility_threshold(&admin, &0);
         let co1 = Address::generate(&env);
         let new_admins = soroban_sdk::vec![&env, admin.clone(), co1.clone()];
 
@@ -9632,12 +9696,14 @@ mod tests {
     }
 
     #[test]
+    fn test_set_eligibility_threshold_non_admin_rejected() {
     fn test_set_admin_quorum_non_admin_rejected() {
         let env = Env::default();
         env.mock_all_auths();
         let (lifecycle, _, _, _admin) = setup(&env, 0);
 
         let outsider = Address::generate(&env);
+        let result = lifecycle.try_set_eligibility_threshold(&outsider, &80);
         let new_admins = soroban_sdk::vec![&env, outsider.clone()];
 
         let result = lifecycle.try_set_admin_quorum(&outsider, &new_admins, &1);
@@ -9650,6 +9716,7 @@ mod tests {
     }
 
     #[test]
+    fn test_set_eligibility_threshold_used_in_is_collateral_eligible() {
     fn test_quorum_pause_requires_all_threshold_signers() {
         let env = Env::default();
         env.mock_all_auths();
@@ -9674,6 +9741,27 @@ mod tests {
         env.mock_all_auths();
         let (lifecycle, asset_registry, engineer_registry, admin) = setup(&env, 0);
 
+        let (asset_id, _owner) = register_asset(&env, &asset_registry);
+        let engineer = Address::generate(&env);
+        lifecycle.authorize_engineer(&admin, &asset_id, &engineer);
+        engineer_registry.register_engineer(&engineer, &String::from_str(&env, "Eng"));
+
+        // Submit enough maintenance records to push score above default threshold (50)
+        for _ in 0..15u32 {
+            let notes = soroban_sdk::String::from_str(&env, "maint");
+            lifecycle.submit_maintenance(&asset_id, &symbol_short!("INSPECT"), &notes, &engineer);
+        }
+
+        // With default threshold (50), asset is eligible
+        assert!(lifecycle.is_collateral_eligible(&asset_id));
+
+        // Raise threshold above current score — asset becomes ineligible
+        lifecycle.set_eligibility_threshold(&admin, &200);
+        assert!(!lifecycle.is_collateral_eligible(&asset_id));
+
+        // Lower threshold back — asset is eligible again
+        lifecycle.set_eligibility_threshold(&admin, &10);
+        assert!(lifecycle.is_collateral_eligible(&asset_id));
         let co1 = Address::generate(&env);
         let new_admins = soroban_sdk::vec![&env, admin.clone(), co1.clone()];
         lifecycle.set_admin_quorum(&admin, &new_admins, &2);
