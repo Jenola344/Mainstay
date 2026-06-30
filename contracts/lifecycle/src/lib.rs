@@ -8154,6 +8154,51 @@ mod tests {
         );
     }
 
+    /// Closes #784 — `decay_score` (which calls `apply_decay`) must also enforce
+    /// `MIN_SCORE_WITH_HISTORY`.  Before the fix, `apply_decay` could write 0 to
+    /// persistent storage for an asset that has maintenance records, making it
+    /// indistinguishable from an asset that was never maintained.
+    #[test]
+    fn test_decay_score_never_drops_to_zero_with_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // One record → raw score = DEFAULT_SCORE_INCREMENT (5).
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "oil change"),
+            &engineer,
+        );
+        assert_eq!(client.get_collateral_score(&asset_id), 5);
+
+        // Advance time far enough for decay to fully consume the raw score.
+        // 2 × decay interval (30 days each) → total decay = 10 > 5, raw result = 0.
+        env.ledger().with_mut(|li| {
+            li.timestamp += 2 * 2_592_000; // 60 days
+        });
+
+        // Calling decay_score directly (not get_collateral_score) must also respect
+        // the floor and return 1, not 0.
+        let decayed = client.decay_score(&asset_id);
+        assert_eq!(
+            decayed, 1,
+            "decay_score must not return 0 for an asset with maintenance history"
+        );
+
+        // The value written to persistent storage must also be >= 1.
+        let stored = client.get_collateral_score(&asset_id);
+        assert_eq!(
+            stored, 1,
+            "stored collateral score must never be 0 for an asset with maintenance history"
+        );
+    }
+
     #[test]
     fn test_collateral_score_never_exceeds_maximum_with_high_volume_maintenance() {
         let env = Env::default();

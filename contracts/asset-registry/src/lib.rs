@@ -2019,6 +2019,48 @@ mod tests {
         assert_ne!(id_a, id_b);
     }
 
+    /// Closes #782 — serial numbers must be globally unique: a different owner must
+    /// not be able to register an asset with the same physical serial number.
+    #[test]
+    fn test_cross_owner_duplicate_serial_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let serial = String::from_str(&env, "SN-GLOBAL-001");
+
+        // First owner registers successfully.
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Machine A metadata"),
+            &serial,
+            &owner_a,
+        );
+        assert_eq!(id, 1);
+
+        // Second owner attempts to register the same physical serial — must be rejected.
+        let result = client.try_register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Machine A metadata different owner"),
+            &serial,
+            &owner_b,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::DuplicateAsset as u32
+            ))),
+            "duplicate serial number must be rejected even for a different owner"
+        );
+    }
+
     #[test]
     fn test_register_asset_emits_event() {
         let env = Env::default();
