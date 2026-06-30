@@ -36,6 +36,8 @@ name = "test_admin_transfer"
 path = "test_admin_transfer.rs"
 
 [[test]]
+name = "test_paused_contract"
+path = "test_paused_contract.rs"
 name = "test_collateral_score_cap"
 path = "test_collateral_score_cap.rs"
 
