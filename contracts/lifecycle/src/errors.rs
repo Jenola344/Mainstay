@@ -1,5 +1,6 @@
 #![no_std]
 
+use shared::error::SharedContractError;
 use soroban_sdk::contracterror;
 
 #[contracterror]
@@ -29,4 +30,22 @@ pub enum ContractError {
     NotesTooLong = 20,
     /// Asset score is frozen due to decommission; decay and mutation are blocked.
     ScoreFrozen = 21,
+    /// Asset is decommissioned and cannot accept maintenance records.
+    AssetDecommissioned = 22,
+    /// Fewer valid signers were provided than the configured admin_threshold requires.
+    InsufficientSigners = 22,
+}
+
+impl From<SharedContractError> for ContractError {
+    fn from(e: SharedContractError) -> Self {
+        match e {
+            SharedContractError::NotInitialized => ContractError::NotInitialized,
+            SharedContractError::AlreadyInitialized => ContractError::AlreadyInitialized,
+            SharedContractError::UnauthorizedAdmin => ContractError::UnauthorizedAdmin,
+            SharedContractError::Paused => ContractError::Paused,
+            SharedContractError::TimelockNotExpired => ContractError::TimelockNotExpired,
+            SharedContractError::ProposalNotFound => ContractError::ProposalNotFound,
+            SharedContractError::PendingAdminAlreadyExists => ContractError::PendingAdminAlreadyExists,
+        }
+    }
 }
