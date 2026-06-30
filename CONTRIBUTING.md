@@ -15,6 +15,23 @@ Thank you for your interest in contributing to Mainstay.
 - **Update CHANGELOG.md** with your changes (see [Changelog Updates](#changelog-updates) below).
 - Ensure secret scanning passes on PRs for `.env` and other configuration files.
 
+## Code review requirements
+
+### Branch protection on `main`
+The `main` branch is protected:
+- **At least 1 approved review** is required before merging.
+- **All CI checks must pass** (build, test, Clippy, rustfmt, cargo audit).
+- **Force pushes and branch deletion are disabled** to preserve history.
+
+### Required reviewers for contracts/
+All changes under `contracts/` — including new contracts, dependency bumps, and
+logic changes — must be approved by a code owner listed in
+[`.github/CODEOWNERS`](.github/CODEOWNERS) before merge. This rule is enforced
+automatically by GitHub's CODEOWNERS mechanism.
+
+If you are adding a new contract subdirectory, update `.github/CODEOWNERS` in
+the same PR so the new path is covered from the first commit.
+
 ## Secret scanning
 - The repository uses `gitleaks` on PRs to detect real secrets before merge.
 - The `.gitleaks.toml` configuration contains standard secret rules plus false-positive allowlists for placeholder values.
