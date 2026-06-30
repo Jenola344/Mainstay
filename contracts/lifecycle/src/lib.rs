@@ -1232,8 +1232,6 @@ impl Lifecycle {
         use engineer_registry::CredentialStatus;
         let status = registry.get_credential_status(&engineer);
         if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
-        let status = registry.verify_engineer(&engineer);
-        if status != CredentialStatus::Valid {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
         require_engineer_authorized(&env, asset_id, &engineer);
