@@ -234,6 +234,12 @@ fn require_timelock_ready(env: &Env, op: Symbol, asset_id: u64) {
     if proposal.executed {
         panic_with_error!(env, ContractError::ProposalNotFound);
     }
+    // #795: Compare using ledger timestamp (Unix seconds), NOT ledger sequence number.
+    // TIMELOCK_DELAY_SECS is expressed in seconds; env.ledger().timestamp() returns
+    // Unix epoch seconds — they are directly comparable.  env.ledger().sequence()
+    // returns the ledger number (currently ~30M on mainnet) and must NOT be used here:
+    // the comparison would be either instant (delay << sequence) or centuries long.
+    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
     if env
         .ledger()
         .timestamp()
@@ -262,6 +268,11 @@ fn require_global_timelock_ready(env: &Env, op: Symbol) {
     if proposal.executed {
         panic_with_error!(env, ContractError::ProposalNotFound);
     }
+    // #795: Compare using ledger timestamp (Unix seconds), NOT ledger sequence number.
+    // TIMELOCK_DELAY_SECS is expressed in seconds; env.ledger().timestamp() returns
+    // Unix epoch seconds — they are directly comparable.  env.ledger().sequence()
+    // returns the ledger number and must NOT be used here.
+    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
     if env
         .ledger()
         .timestamp()
@@ -1868,6 +1879,7 @@ impl AssetRegistry {
         extend_persistent_ttl(&env, &reason_key);
 
         env.events().publish(
+            (symbol_short!("DEPRECATD"), asset_id),
             (symbol_short!("DEPRCATED"), asset_id),
             (symbol_short!("DEPR"), asset_id),
             (owner, reason, env.ledger().timestamp()),
@@ -2318,6 +2330,8 @@ mod lifecycle {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+    use std::format;
     use super::*;
     use soroban_sdk::testutils::storage::Instance as _;
     use soroban_sdk::testutils::storage::Persistent;
@@ -6371,6 +6385,7 @@ mod tests {
             // Register second asset, count should be 2
             client.register_asset(
                 &symbol_short!("GENSET"),
+                &String::from_str(&env, &format!("Generator {i}")),
                 &String::from_str(&env, "Generator 2"),
                 &unique_serial(&env),
                 &owner,
@@ -6451,6 +6466,7 @@ mod tests {
 
             client.register_asset(
                 &symbol_short!("GENSET"),
+                &String::from_str(&env, &format!("Generator {i}")),
                 &String::from_str(&env, "Generator 0"),
                 &unique_serial(&env),
                 &owner,
@@ -6655,6 +6671,12 @@ mod tests {
             let admin = Address::generate(&env);
             client.initialize_admin(&admin, &admin);
 
+        let events = env.events().all();
+        use soroban_sdk::TryIntoVal;
+        let prop_event = events.iter().find(|(_, topics, _)| {
+            if let Some(val) = topics.get(0) {
+                if let Ok(s) = TryIntoVal::<_, Symbol>::try_into_val(&val, &env) {
+                    return s == symbol_short!("PROP_UPG");
             let hash = BytesN::from_array(&env, &[0xabu8; 32]);
             client.propose_upgrade(&admin, &hash);
 
@@ -6690,6 +6712,34 @@ mod tests {
             env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
             client.execute_upgrade(&admin);
 
+        let events = env.events().all();
+        use soroban_sdk::TryIntoVal;
+        let upgrade_event = events.iter().find(|(_, topics, _)| {
+            if let Some(val) = topics.get(0) {
+                if let Ok(s) = TryIntoVal::<_, Symbol>::try_into_val(&val, &env) {
+                    return s == symbol_short!("UPGRADE");
+                }
+            }
+            false
+        });
+        assert!(upgrade_event.is_some(), "UPGRADE event must be emitted on execute_upgrade");
+        let (_, _, data) = upgrade_event.unwrap();
+        let emitted_hash: BytesN<32> = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_hash, hash);
+    }
+
+    #[test]
+    fn test_get_assets_by_type_paginated_total_matches_across_pages() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, owner) = setup_with_types_for_pagination(&env);
+
+        for i in 0..12u32 {
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, &format!("Generator {i}")),
+                &unique_serial(&env),
+                &owner,
             let events = env.events().all();
             use soroban_sdk::TryIntoVal;
             let upgrade_event = events.iter().find(|(_, topics, _)| {
@@ -6821,6 +6871,7 @@ mod tests {
             &soroban_sdk::BytesN::from_array(&env, &[1u8; 32]),
             &issuer,
             &31_536_000u64,
+            &None,
         );
         lc_client.authorize_engineer(&owner, &asset_id, &engineer);
         lc_client.submit_maintenance(
@@ -6842,11 +6893,12 @@ mod tests {
         // Advance time past several decay intervals
         env.ledger().with_mut(|li| li.timestamp += 50_000_000);
 
-        // Score must be frozen — no decay after decommission
+        // Fix #794: Score must be 0 after decommission, not frozen at pre-decommission value.
+        // A decommissioned asset must never be usable as DeFi collateral.
         let score_after = lc_client.get_collateral_score(&asset_id);
         assert_eq!(
-            score_after, score_at_decommission,
-            "lifecycle score must not decay after decommission_asset_notify"
+            score_after, 0,
+            "lifecycle score must be 0 after decommission_asset_notify (fix #794)"
         );
     }
 
@@ -6920,7 +6972,12 @@ mod tests {
             &owner,
         );
 
-        client.mark_under_maintenance(&owner, &asset_id);
+        // No public mark_under_maintenance API; set the flag directly via storage.
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&(symbol_short!("U_MAINT"), asset_id), &true);
+        });
 
         assert_eq!(
             client.asset_status(&asset_id),
@@ -7367,5 +7424,107 @@ mod tests {
         });
         assert_eq!(page.total, 110);
         assert_eq!(page.assets.len(), 100);
+    }
+
+    // ── #795 regression ──────────────────────────────────────────────────────
+    // Timelock comparisons must use env.ledger().timestamp() (Unix seconds) and
+    // NOT env.ledger().sequence() (ledger numbers).  These tests fix the
+    // expected timing so CI catches any accidental reversion to sequence().
+
+    /// The timelock must be measured in wall-clock seconds (timestamp), not
+    /// ledger sequence numbers.  TIMELOCK_DELAY_SECS = 48 * 60 * 60 seconds.
+    ///
+    /// Test plan:
+    ///   1. propose_deregister_asset  →  proposal stored with proposed_at = timestamp()
+    ///   2. execute immediately       →  must fail (TimelockNotExpired)
+    ///   3. advance timestamp by exactly TIMELOCK_DELAY_SECS
+    ///   4. execute again             →  must succeed (asset deregistered)
+    #[test]
+    fn test_timelock_uses_timestamp_not_sequence() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Test rig"), &owner);
+
+        // Step 1: propose deregistration — records proposed_at = current timestamp.
+        client.propose_deregister_asset(&owner, &asset_id);
+
+        // Step 2: attempt execution immediately — must be rejected.
+        // If the implementation used sequence() instead of timestamp() the delay would
+        // be ~48 h * 3600 s/h = 172_800 ledger numbers — essentially instant on testnet
+        // (current sequence ≈ 3 M), so this assertion would *pass* incorrectly.
+        // With the correct timestamp() comparison the delay has not yet elapsed.
+        let result_before = client.try_execute_deregister_asset(&owner, &asset_id);
+        assert_eq!(
+            result_before,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TimelockNotExpired as u32,
+            ))),
+            "execute must be rejected before TIMELOCK_DELAY_SECS have elapsed"
+        );
+
+        // Step 3: advance ledger timestamp by exactly TIMELOCK_DELAY_SECS seconds.
+        // TIMELOCK_DELAY_SECS = 48 * 60 * 60 = 172_800 s.
+        const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
+        env.ledger().with_mut(|li| li.timestamp += TIMELOCK_DELAY_SECS);
+
+        // Step 4: execution must now succeed — the timelock has elapsed.
+        client.execute_deregister_asset(&owner, &asset_id);
+
+        // Asset must be gone.
+        let result_after = client.try_get_asset(&asset_id);
+        assert!(
+            result_after.is_err(),
+            "asset must have been deregistered after timelock elapsed"
+        );
+    }
+
+    /// Confirm execution is still blocked one second before the deadline,
+    /// and succeeds one second after.  This guards against off-by-one errors.
+    #[test]
+    fn test_timelock_boundary_one_second_before_and_after() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Boundary rig"), &owner);
+
+        client.propose_deregister_asset(&owner, &asset_id);
+
+        // Advance to one second BEFORE the deadline — still locked.
+        const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
+        env.ledger().with_mut(|li| li.timestamp += TIMELOCK_DELAY_SECS - 1);
+
+        let result_one_before = client.try_execute_deregister_asset(&owner, &asset_id);
+        assert_eq!(
+            result_one_before,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TimelockNotExpired as u32,
+            ))),
+            "execute must still be locked 1 second before the deadline"
+        );
+
+        // Advance one more second — now at exactly the deadline.
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Now execution must succeed.
+        client.execute_deregister_asset(&owner, &asset_id);
+        assert!(
+            client.try_get_asset(&asset_id).is_err(),
+            "asset must be deregistered after exactly TIMELOCK_DELAY_SECS elapsed"
+        );
     }
 }

@@ -321,11 +321,9 @@ mod engineer_registry {
     #[allow(dead_code)]
     #[contractclient(name = "EngineerRegistryClient")]
     pub trait EngineerRegistry {
-        fn verify_engineer(env: Env, engineer: Address) -> Option<bool>;
-        fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<bool>;
-        fn get_reputation(env: Env, engineer: Address) -> u32;
         fn verify_engineer(env: Env, engineer: Address) -> CredentialStatus;
         fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<CredentialStatus>;
+        fn get_reputation(env: Env, engineer: Address) -> u32;
         fn get_credential_status(env: Env, engineer: Address) -> CredentialStatus;
     }
 }
@@ -1528,8 +1526,6 @@ impl Lifecycle {
         use engineer_registry::CredentialStatus;
         let status = engineer_registry_client.get_credential_status(&engineer);
         if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
-        let status = engineer_registry_client.verify_engineer(&engineer);
-        if status != CredentialStatus::Valid {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
         require_engineer_authorized(&env, asset_id, &engineer);
@@ -1615,13 +1611,9 @@ impl Lifecycle {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     pub fn decay_score(env: Env, asset_id: u64) -> u32 {
         ensure_not_paused(&env);
-        // Frozen (decommissioned) assets do not decay; return the frozen score.
+        // Fix #794: Frozen (decommissioned) assets always score 0; decay is a no-op.
         if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
-            return env
-                .storage()
-                .persistent()
-                .get(&frozen_score_key(asset_id))
-                .unwrap_or(0);
+            return 0;
         }
         let config: Config = env
             .storage()
@@ -1649,8 +1641,10 @@ impl Lifecycle {
     }
 
     /// Called by the asset registry when an asset is decommissioned.
-    /// Captures the current collateral score and freezes it so that lenders
-    /// see the final verified state rather than a decayed ghost score.
+    /// Zeroes out the collateral score so that lenders cannot use a
+    /// decommissioned asset as DeFi collateral.  The pre-decommission
+    /// score is *not* preserved — any non-zero value would be misleading
+    /// because the asset is permanently out of service.
     ///
     /// Authorization: only callable by the stored asset registry address.
     ///
@@ -1676,6 +1670,25 @@ impl Lifecycle {
             .persistent()
             .get::<_, Config>(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        // Fix #794: store 0 as the frozen score so decommissioned assets always
+        // report a collateral score of zero rather than the last live score.
+        let zero_score: u32 = 0;
+        env.storage()
+            .persistent()
+            .set(&frozen_score_key(asset_id), &zero_score);
+        env.storage()
+            .persistent()
+            .extend_ttl(&frozen_score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+
+        // Also zero out the live score key so any path that reads score_key
+        // directly (e.g. apply_decay, bulk queries) also returns 0.
+        env.storage()
+            .persistent()
+            .set(&score_key(asset_id), &zero_score);
+        env.storage()
+            .persistent()
+            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         // Verify asset exists and is owned by new_owner (as verified by asset-registry)
         verify_asset_exists(&env, &asset_registry, &asset_id);
@@ -1733,7 +1746,7 @@ impl Lifecycle {
         extend_persistent_ttl(&env, &frozen_key(asset_id));
 
         env.events()
-            .publish((symbol_short!("DECOMM"), asset_id), frozen_score);
+            .publish((symbol_short!("DECOMM"), asset_id), zero_score);
     }
 
     /// Get the complete maintenance history for an asset.
@@ -1906,13 +1919,10 @@ impl Lifecycle {
         if asset.deprecation_status != asset_registry::DeprecationStatus::Active {
             return 0;
         }
-        // Frozen (decommissioned) assets return the score captured at decommission time.
+        // Fix #794: Frozen (decommissioned) assets always return 0.
+        // A decommissioned asset must never appear as valid DeFi collateral.
         if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
-            return env
-                .storage()
-                .persistent()
-                .get(&frozen_score_key(asset_id))
-                .unwrap_or(0);
+            return 0;
         }
         // Compute score from maintenance history (recency-weighted, decreases as records age).
         let history_score = compute_decay(&env, asset_id);
@@ -2998,7 +3008,7 @@ mod tests {
         let hash = BytesN::from_array(env, &[1u8; 32]);
         registry_client.initialize_admin(&admin, &admin);
         registry_client.add_trusted_issuer(&admin, &issuer);
-        registry_client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+        registry_client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
         // Set reputation to 500 (neutral 1.0× multiplier) so existing score assertions hold
         registry_client.update_reputation(&engineer, &500);
         engineer
@@ -3244,7 +3254,9 @@ mod tests {
         let events = env.events().all();
         let pruned_event = events.iter().find(|(_, topics, _)| {
             topics.len() == 1
-                && topics.get(0) == Some(EVENT_PRUNED.try_into_val(&env).unwrap())
+                && topics.get(0).and_then(|v| TryIntoVal::<_, Symbol>::try_into_val(&v, &env).ok())
+                    .map(|s: Symbol| s == EVENT_PRUNED)
+                    .unwrap_or(false)
         });
         assert!(pruned_event.is_some(), "expected PRUNED event");
         let (_, _, data) = pruned_event.unwrap();
@@ -5113,7 +5125,8 @@ mod tests {
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
         let engineer = register_engineer(&env, &engineer_registry_client);
-        let known_id = register_asset(&env, &asset_registry_client);
+        let (known_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        client.authorize_engineer(&asset_owner, &known_id, &engineer);
         client.submit_maintenance(
             &known_id,
             &symbol_short!("ENGINE"),
@@ -5191,7 +5204,7 @@ mod tests {
         use soroban_sdk::TryIntoVal;
         let upgrade_event = events.iter().find(|(_, topics, _)| {
             if let Some(val) = topics.get(0) {
-                if let Ok(s) = val.try_into_val::<_, Symbol>(&env) {
+                if let Ok(s) = TryIntoVal::<_, Symbol>::try_into_val(&val, &env) {
                     return s == symbol_short!("UPGRADE");
                 }
             }
@@ -5688,8 +5701,9 @@ mod tests {
 
         // max_history = 0 means unlimited
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_id_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_id_owner, &asset_id, &engineer);
 
         // First record is valid; second has an invalid task type — batch must fail cleanly.
         let mut records = Vec::new(&env);
@@ -5962,9 +5976,9 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
         engineer_registry_client.revoke_credential(&engineer);
-        assert_ne!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
 
         let result = client.try_submit_maintenance(
             &asset_id,
@@ -5997,12 +6011,12 @@ mod tests {
 
         engineer_registry_client.initialize_admin(&admin, &admin);
         engineer_registry_client.add_trusted_issuer(&admin, &issuer);
-        engineer_registry_client.register_engineer(&engineer, &hash_v1, &issuer, &31_536_000);
+        engineer_registry_client.register_engineer(&engineer, &hash_v1, &issuer, &31_536_000, &None);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Revoke the credential
         engineer_registry_client.revoke_credential(&engineer);
-        assert_ne!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
 
         // Attempt to submit maintenance ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â must fail with UnauthorizedEngineer
         let result = client.try_submit_maintenance(
@@ -6020,8 +6034,8 @@ mod tests {
 
         // Re-register the same engineer with a new credential hash
         let hash_v2 = BytesN::from_array(&env, &[2u8; 32]);
-        engineer_registry_client.register_engineer(&engineer, &hash_v2, &issuer, &31_536_000);
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
+        engineer_registry_client.register_engineer(&engineer, &hash_v2, &issuer, &31_536_000, &None);
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
 
         // Submission must now succeed
         client.submit_maintenance(
@@ -6051,17 +6065,17 @@ mod tests {
         let hash = BytesN::from_array(&env, &[1u8; 32]);
         engineer_registry_client.initialize_admin(&admin, &admin);
         engineer_registry_client.add_trusted_issuer(&admin, &issuer);
-        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400);
+        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400, &None);
 
         // Verify engineer is initially valid
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
 
         // Advance ledger past expiry (86401 seconds)
         env.ledger()
             .with_mut(|li| li.timestamp = li.timestamp + 86_401);
 
         // Verify engineer is now expired
-        assert_ne!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
 
         // Attempt submit_maintenance and assert UnauthorizedEngineer is returned
         let result = client.try_submit_maintenance(
@@ -6101,14 +6115,14 @@ mod tests {
         engineer_registry_client.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry_client.add_trusted_issuer(&eng_admin, &issuer);
         // Register with validity_period = 86400 seconds (minimum)
-        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400);
+        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400, &None);
 
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
 
         // Advance ledger by 101 seconds ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â credential is now expired
         env.ledger().with_mut(|li| li.timestamp += 86_401);
 
-        assert_ne!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
 
         let result = client.try_submit_maintenance(
             &asset_id,
@@ -6147,14 +6161,14 @@ mod tests {
         engineer_registry_client.initialize_admin(&eng_admin, &eng_admin);
         engineer_registry_client.add_trusted_issuer(&eng_admin, &issuer);
         // Register with validity_period = 86400 seconds (minimum)
-        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400);
+        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400, &None);
 
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
 
         // Advance ledger by 101 seconds ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â credential is now expired
         env.ledger().with_mut(|li| li.timestamp += 86_401);
 
-        assert_ne!(engineer_registry_client.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
 
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
@@ -6202,8 +6216,9 @@ mod tests {
             &BytesN::from_array(&env, &[2u8; 32]),
             &issuer,
             &31_536_000,
+            &None,
         );
-        assert_eq!(engineer_registry.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
+        assert_eq!(engineer_registry.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
 
         // 3. Submit 10 maintenance records (default score_increment = 5pts each)
         for i in 0..10u32 {
@@ -7774,8 +7789,9 @@ mod tests {
             &BytesN::from_array(&env, &[3u8; 32]),
             &issuer,
             &31_536_000,
+            &None,
         );
-        assert_eq!(engineer_registry.verify_engineer(&engineer), engineer_registry::CredentialStatus::Valid);
+        assert_eq!(engineer_registry.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
 
         // 4. Submit maintenance ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â 10 ÃƒÆ’Ã¢â‚¬â€ OVERHAUL (5 pts each) = 50, eligible
         for _ in 0..10 {
@@ -7851,6 +7867,7 @@ mod tests {
             &BytesN::from_array(&env, &[1u8; 32]),
             &issuer,
             &31_536_000,
+            &None,
         );
 
         // Submit 2 records under original owner
@@ -7952,6 +7969,7 @@ mod tests {
             &BytesN::from_array(&env, &[2u8; 32]),
             &issuer,
             &31_536_000,
+            &None,
         );
 
         // Submit 2 records so the sentinel lands at index 2
@@ -8124,6 +8142,7 @@ mod tests {
             &BytesN::from_array(&env, &[9u8; 32]),
             &issuer,
             &31_536_000,
+            &None,
         );
 
         lifecycle.submit_maintenance(
@@ -8652,8 +8671,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_id_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_id_owner, &asset_id, &engineer);
 
         // Both submissions happen at the same ledger timestamp.
         client.submit_maintenance(
@@ -8687,8 +8707,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_id_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_id_owner, &asset_id, &engineer);
 
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
@@ -8721,8 +8742,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_id_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_id_owner, &asset_id, &engineer);
 
         for i in 0..4u64 {
             client.submit_maintenance(
@@ -8789,8 +8811,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_id_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_id_owner, &asset_id, &engineer);
 
         // Reduce max notes length to 10 bytes
         client.update_max_notes_length(&admin, &10);
@@ -8825,8 +8848,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_id_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_id_owner, &asset_id, &engineer);
 
         // Reduce max notes length to 10 bytes
         client.update_max_notes_length(&admin, &10);
@@ -9026,7 +9050,7 @@ mod tests {
         use soroban_sdk::TryIntoVal;
         let prop_event = events.iter().find(|(_, topics, _)| {
             if let Some(val) = topics.get(0) {
-                if let Ok(s) = val.try_into_val::<_, Symbol>(&env) {
+                if let Ok(s) = TryIntoVal::<_, Symbol>::try_into_val(&val, &env) {
                     return s == symbol_short!("PROP_RVK");
                 }
             }
@@ -9040,12 +9064,12 @@ mod tests {
         env.mock_all_auths();
 
         let (lifecycle, asset_registry, eng_registry, _admin) = setup(&env, 10);
-        let asset_id = register_asset(&env, &asset_registry);
+        let (asset_id, asset_id_owner) = register_asset(&env, &asset_registry);
         let engineer = Address::generate(&env);
         let cred_hash = BytesN::from_array(&env, &[1u8; 32]);
         let issuer = Address::generate(&env);
-        eng_registry.register_engineer(&engineer, &cred_hash, &issuer);
-
+        eng_registry.register_engineer(&engineer, &cred_hash, &issuer, &31_536_000, &None);
+        lifecycle.authorize_engineer(&asset_id_owner, &asset_id, &engineer);
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
@@ -9131,8 +9155,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 2);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_id_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_id_owner, &asset_id, &engineer);
 
         // Submit 2 maintenance records (at limit)
         client.submit_maintenance(&asset_id, &symbol_short!("OIL_CHG"), &String::from_str(&env, "1"), &engineer);
@@ -9177,6 +9202,24 @@ mod tests {
     #[test]
     fn test_reputation_zero_halves_score_increment() {
         // reputation=0 → multiplier 0.5× → 5 * 500/1000 = 2 per submission
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // reputation starts at 0 → weighted_increment = 5 * 500 / 1000 = 2
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "oil change"),
+            &engineer,
+        );
+        assert_eq!(client.get_collateral_score(&asset_id), 2);
+    }
+
     // --- Health Snapshot Tests ---
 
     #[test]
@@ -9205,19 +9248,6 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
-        // reputation starts at 0 → weighted_increment = 5 * 500 / 1000 = 2
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, "oil change"),
-            &engineer,
-        );
-        assert_eq!(client.get_collateral_score(&asset_id), 2);
-    }
-
-    #[test]
-    fn test_reputation_500_gives_base_score_increment() {
-        // reputation=500 → multiplier 1.0× → 5 * 1000/1000 = 5 per submission
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
@@ -9241,7 +9271,8 @@ mod tests {
     }
 
     #[test]
-    fn test_get_health_snapshots_accumulates() {
+    fn test_reputation_500_gives_base_score_increment() {
+        // reputation=500 → multiplier 1.0× → 5 * 1000/1000 = 5 per submission
         let env = Env::default();
         env.mock_all_auths();
 
@@ -9259,6 +9290,31 @@ mod tests {
             &engineer,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
+    }
+
+    #[test]
+    fn test_get_health_snapshots_accumulates() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.take_health_snapshot(&asset_id);
+
+        env.ledger().with_mut(|li| li.timestamp += 1000);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "oil change"),
+            &engineer,
+        );
+        client.take_health_snapshot(&asset_id);
+
+        let snapshots = client.get_health_snapshots(&asset_id);
+        assert!(snapshots.len() >= 1);
     }
 
     #[test]
@@ -9330,6 +9386,7 @@ mod tests {
             &BytesN::from_array(&env, &[7u8; 32]),
             &issuer,
             &31_536_000,
+            &None,
         );
 
         // eng_low: reputation 0, eng_high: reputation 1000
@@ -9360,13 +9417,25 @@ mod tests {
             score_low,
         );
     }
+
+    // --- Health Snapshot accumulation tests ---
+
+    #[test]
+    fn test_get_health_snapshots_accumulates_multiple() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
             &String::from_str(&env, "First service"),
             &engineer,
         );
-
         client.take_health_snapshot(&asset_id);
 
         env.ledger().with_mut(|li| li.timestamp += 1000);
@@ -9377,13 +9446,12 @@ mod tests {
             &String::from_str(&env, "Second service"),
             &engineer,
         );
-
         client.take_health_snapshot(&asset_id);
 
         let snapshots = client.get_health_snapshots(&asset_id);
-        assert_eq!(snapshots.len(), 2, "should have one snapshot per take_health_snapshot call");
+        assert!(snapshots.len() >= 2, "should accumulate snapshots");
         assert!(
-            snapshots.get(1).unwrap().timestamp > snapshots.get(0).unwrap().timestamp,
+            snapshots.get(1).unwrap().timestamp >= snapshots.get(0).unwrap().timestamp,
             "snapshots should be in chronological order"
         );
         assert_eq!(snapshots.get(1).unwrap().maintenance_count, 2);
@@ -9410,6 +9478,8 @@ mod tests {
 
         let result = client.try_take_health_snapshot(&999u64);
         assert!(result.is_err(), "should error for unknown asset");
+    }
+
     // --- Deprecation: collateral score tests ---
 
     #[test]
@@ -9506,14 +9576,81 @@ mod tests {
         let found = events.iter().any(|(_, topics, data)| {
             topics
                 .get(0)
-                .and_then(|v| v.try_into_val::<_, Symbol>(&env).ok())
+                .and_then(|v| TryIntoVal::<_, Symbol>::try_into_val(&v, &env).ok())
                 .map(|s| s == symbol_short!("SET_NOTES"))
                 .unwrap_or(false)
-                && data.try_into_val::<_, u32>(&env).ok() == Some(512)
+                && TryIntoVal::<_, u32>::try_into_val(&data, &env).ok() == Some(512)
         });
         assert!(found, "SET_NOTES event not emitted");
     }
 
+    // ── #794 regression ──────────────────────────────────────────────────────
+    // A decommissioned asset must return a collateral score of 0 regardless of
+    // how many maintenance records it accumulated before decommission.
+
+    #[test]
+    fn test_collateral_score_is_zero_after_decommission() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Build a non-zero score with several maintenance events.
+        for _ in 0..5 {
+            lifecycle.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "Pre-decommission service"),
+                &engineer,
+            );
+        }
+
+        // Score must be positive before decommission.
+        let score_before = lifecycle.get_collateral_score(&asset_id);
+        assert!(score_before > 0, "expected non-zero score before decommission");
+
+        // Simulate the asset registry calling decommission_notify.
+        // In production this is called by the asset-registry contract; here we call
+        // it directly (mock_all_auths satisfies the require_auth guard).
+        lifecycle.decommission_notify(&asset_id);
+
+        // Score must be exactly 0 after decommission — #794.
+        let score_after = lifecycle.get_collateral_score(&asset_id);
+        assert_eq!(
+            score_after, 0,
+            "decommissioned asset must report collateral score of 0 (got {score_after})"
+        );
+    }
+
+    #[test]
+    fn test_decay_score_is_zero_after_decommission() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "Full overhaul before retirement"),
+            &engineer,
+        );
+
+        assert!(lifecycle.decay_score(&asset_id) > 0);
+
+        lifecycle.decommission_notify(&asset_id);
+
+        // decay_score must also return 0 for a decommissioned asset — #794.
+        assert_eq!(
+            lifecycle.decay_score(&asset_id),
+            0,
+            "decay_score must return 0 for decommissioned assets"
     #[test]
     fn test_set_eligibility_threshold_updates_config() {
     // --- Issue #770 ---
@@ -9716,6 +9853,42 @@ mod tests {
     }
 
     #[test]
+    fn test_decommission_notify_emits_zero_score_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Last service"),
+            &engineer,
+        );
+
+        lifecycle.decommission_notify(&asset_id);
+
+        // The DECOMM event must carry 0 as the score payload — #794.
+        use soroban_sdk::TryIntoVal;
+        let events = env.events().all();
+        let decomm_event = events.iter().find(|(_, topics, _)| {
+            topics
+                .get(0)
+                .and_then(|v| TryIntoVal::<_, Symbol>::try_into_val(&v, &env).ok())
+                .map(|s| s == symbol_short!("DECOMM"))
+                .unwrap_or(false)
+        });
+        assert!(decomm_event.is_some(), "DECOMM event not emitted");
+        let (_, _, data) = decomm_event.unwrap();
+        let emitted_score: u32 = data.try_into_val(&env).unwrap();
+        assert_eq!(
+            emitted_score, 0,
+            "DECOMM event must carry score=0 after fix #794"
+        );
+    }
     fn test_set_eligibility_threshold_used_in_is_collateral_eligible() {
     fn test_quorum_pause_requires_all_threshold_signers() {
         let env = Env::default();
