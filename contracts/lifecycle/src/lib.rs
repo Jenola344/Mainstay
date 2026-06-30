@@ -5,7 +5,7 @@ mod scoring;
 mod types;
 
 use crate::errors::ContractError;
-use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push};
+use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
     BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, ScoreEntry, TimelockProposal,
     TransferRecord,
@@ -2167,6 +2167,36 @@ impl Lifecycle {
         final_score
     }
 
+    /// Return the current collateral valuation and its timestamp for an asset.
+    ///
+    /// The valuation currently tracks the asset's collateral score as a `u64` so that
+    /// analytics consumers can query it using a stable valuation-history interface.
+    pub fn get_collateral_valuation(env: Env, asset_id: u64) -> (u64, u64) {
+        let value = Self::get_collateral_score(env.clone(), asset_id) as u64;
+        let history: Vec<(u64, u64)> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CollateralValuationHistory(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if history.is_empty() {
+            (value, env.ledger().timestamp())
+        } else {
+            let (timestamp, value) = history.get(history.len() - 1).unwrap();
+            (value, timestamp)
+        }
+    }
+
+    /// Return the chronological collateral valuation history for an asset.
+    pub fn get_valuation_history(env: Env, asset_id: u64) -> Vec<(u64, u64)> {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        env.storage()
+            .persistent()
+            .get(&DataKey::CollateralValuationHistory(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Get collateral scores for multiple assets in a single call.
     ///
     /// # Arguments
@@ -2945,6 +2975,27 @@ impl Lifecycle {
             }
         }
 
+        let valuation_history_key = DataKey::CollateralValuationHistory(asset_id);
+        if let Some(valuation_history) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<(u64, u64)>>(&valuation_history_key)
+        {
+            if valuation_history.len() > config.max_history {
+                let start_idx = valuation_history.len() - config.max_history;
+                let mut pruned = Vec::new(&env);
+                for i in start_idx..valuation_history.len() {
+                    pruned.push_back(valuation_history.get(i).unwrap());
+                }
+                env.storage().persistent().set(&valuation_history_key, &pruned);
+                env.storage().persistent().extend_ttl(
+                    &valuation_history_key,
+                    TTL_THRESHOLD,
+                    TTL_TARGET,
+                );
+            }
+        }
+
         env.events()
             .publish((symbol_short!("PRUNE"), admin.clone()), asset_id);
         env.events().publish(
@@ -3012,6 +3063,9 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .remove(&score_history_key(asset_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CollateralValuationHistory(asset_id));
         env.storage()
             .persistent()
             .remove(&last_update_key(asset_id));
@@ -3255,6 +3309,79 @@ mod tests {
 
         assert_eq!(client.get_collateral_score(&asset_id), 50);
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 10);
+    }
+
+    #[test]
+    fn test_get_collateral_valuation_returns_current_value_and_timestamp() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Routine oil change"),
+            &engineer,
+        );
+
+        let (timestamp, value) = client.get_valuation_history(&asset_id).get(0).unwrap();
+        let current = client.get_collateral_valuation(&asset_id);
+        assert_eq!(current, (value, timestamp));
+        assert_eq!(value, client.get_collateral_score(&asset_id) as u64);
+    }
+
+    #[test]
+    fn test_valuation_history_records_on_score_updates() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "First service"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 31 * 24 * 60 * 60);
+        client.decay_score(&asset_id);
+
+        let history = client.get_valuation_history(&asset_id);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.get(0).unwrap().1, 5);
+        assert_eq!(history.get(1).unwrap().1, 0);
+    }
+
+    #[test]
+    fn test_valuation_history_records_reset_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "First service"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        client.reset_score(&admin, &asset_id);
+
+        let history = client.get_valuation_history(&asset_id);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.get(0).unwrap().1, 5);
+        assert_eq!(history.get(1).unwrap().1, 0);
     }
 
     #[test]

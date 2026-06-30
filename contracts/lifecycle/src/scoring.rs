@@ -1,7 +1,7 @@
 #![no_std]
 
 use crate::errors::ContractError;
-use crate::types::{Config, MaintenanceRecord, ScoreEntry};
+use crate::types::{Config, DataKey, MaintenanceRecord, ScoreEntry};
 use soroban_sdk::{panic_with_error, symbol_short, Env, Symbol, Vec};
 
 pub fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_history: u32) {
@@ -24,10 +24,42 @@ pub fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_histo
             shared::extend_persistent_ttl(&env, &key);
             return;
         }
+        history.push_back(entry);
+        env.storage().persistent().set(&key, &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
     }
 
-    if max_history > 0 && history.len() >= max_history {
-        history.remove(0);
+    pub fn valuation_history_push(env: &Env, asset_id: u64, timestamp: u64, value: u64, max_history: u32) {
+        let key = DataKey::CollateralValuationHistory(asset_id);
+        let mut history: Vec<(u64, u64)> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let last_idx = history.len().saturating_sub(1);
+        if !history.is_empty() {
+            let last = history.get(last_idx).unwrap();
+            if last.0 == timestamp {
+                history.set(last_idx, (timestamp, value));
+                env.storage().persistent().set(&key, &history);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+                return;
+            }
+        }
+
+        if max_history > 0 && history.len() >= max_history {
+            history.remove(0);
+        }
+        history.push_back((timestamp, value));
+        env.storage().persistent().set(&key, &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
     }
     history.push_back(entry);
     env.storage().persistent().set(&key, &history);
