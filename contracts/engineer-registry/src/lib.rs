@@ -26,6 +26,9 @@ pub enum ContractError {
     TimelockNotExpired = 15,
     ProposalNotFound = 16,
     BatchRevokeTooLarge = 17,
+    InvalidSpecialization = 18,
+    SpecializationAlreadyExists = 19,
+    SpecializationNotFound = 20,
 }
 
 #[contracttype]
@@ -39,6 +42,7 @@ pub struct Engineer {
     pub expires_at: u64,
     pub reputation_score: u32,
     pub notes: Option<soroban_sdk::String>,
+    pub specializations: Vec<Symbol>,
 }
 
 #[contracttype]
@@ -282,6 +286,7 @@ impl EngineerRegistry {
             expires_at: now + validity_period,
             reputation_score: 0,
             notes,
+            specializations: Vec::new(&env),
         };
         env.storage()
             .persistent()
@@ -1186,6 +1191,167 @@ impl EngineerRegistry {
             .get::<_, Engineer>(&engineer_key(&engineer))
             .map(|e| e.reputation_score)
             .unwrap_or(0)
+    }
+
+    /// Add a specialization to an engineer's profile.
+    /// Only the engineer's original issuer can modify specializations.
+    ///
+    /// # Arguments
+    /// * `issuer` - The issuer address (must match the engineer's original issuer)
+    /// * `engineer` - The address of the engineer
+    /// * `specialization` - The specialization symbol (must be a valid allowed value)
+    ///
+    /// # Panics
+    /// - [`ContractError::EngineerNotFound`] if the engineer record does not exist
+    /// - [`ContractError::UntrustedIssuer`] if the issuer is not trusted
+    /// - [`ContractError::UnauthorizedAdmin`] if the caller is not the engineer's original issuer
+    /// - [`ContractError::InvalidSpecialization`] if the specialization is not in the allowed list
+    /// - [`ContractError::SpecializationAlreadyExists`] if the engineer already has this specialization
+    /// - [`ContractError::CredentialRevoked`] if the engineer's credential has been revoked
+    pub fn add_specialization(
+        env: Env,
+        issuer: Address,
+        engineer: Address,
+        specialization: Symbol,
+    ) {
+        ensure_not_paused(&env);
+        issuer.require_auth();
+        if !env.storage().instance().has(&trusted_key(&issuer)) {
+            panic_with_error!(&env, ContractError::UntrustedIssuer);
+        }
+
+        let allowed_specs: [Symbol; 8] = [
+            symbol_short!("diesel_ge"),
+            symbol_short!("wind_turb"),
+            symbol_short!("solar_pnl"),
+            symbol_short!("grid_infr"),
+            symbol_short!("gas_turbn"),
+            symbol_short!("hydroelec"),
+            symbol_short!("batteryst"),
+            symbol_short!("transform"),
+        ];
+        let mut found = false;
+        for allowed in allowed_specs.iter() {
+            if *allowed == specialization {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            panic_with_error!(&env, ContractError::InvalidSpecialization);
+        }
+
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+
+        if record.issuer != issuer {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if !record.active {
+            panic_with_error!(&env, ContractError::CredentialRevoked);
+        }
+
+        for spec in record.specializations.iter() {
+            if spec == specialization {
+                panic_with_error!(&env, ContractError::SpecializationAlreadyExists);
+            }
+        }
+
+        record.specializations.push_back(specialization.clone());
+        env.storage()
+            .persistent()
+            .set(&engineer_key(&engineer), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("ADD_SPEC"), engineer.clone()),
+            (specialization,),
+        );
+    }
+
+    /// Remove a specialization from an engineer's profile.
+    /// Only the engineer's original issuer can modify specializations.
+    /// Silently succeeds if the specialization does not exist.
+    ///
+    /// # Arguments
+    /// * `issuer` - The issuer address (must match the engineer's original issuer)
+    /// * `engineer` - The address of the engineer
+    /// * `specialization` - The specialization symbol to remove
+    ///
+    /// # Panics
+    /// - [`ContractError::EngineerNotFound`] if the engineer record does not exist
+    /// - [`ContractError::UntrustedIssuer`] if the issuer is not trusted
+    /// - [`ContractError::UnauthorizedAdmin`] if the caller is not the engineer's original issuer
+    pub fn remove_specialization(
+        env: Env,
+        issuer: Address,
+        engineer: Address,
+        specialization: Symbol,
+    ) {
+        ensure_not_paused(&env);
+        issuer.require_auth();
+        if !env.storage().instance().has(&trusted_key(&issuer)) {
+            panic_with_error!(&env, ContractError::UntrustedIssuer);
+        }
+
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+
+        if record.issuer != issuer {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        let mut new_specs: Vec<Symbol> = Vec::new(&env);
+        let mut found = false;
+        for spec in record.specializations.iter() {
+            if spec == specialization {
+                found = true;
+            } else {
+                new_specs.push_back(spec);
+            }
+        }
+
+        if found {
+            record.specializations = new_specs;
+            env.storage()
+                .persistent()
+                .set(&engineer_key(&engineer), &record);
+            env.storage()
+                .persistent()
+                .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+
+            env.events().publish(
+                (symbol_short!("RM_SPEC"), engineer.clone()),
+                (specialization,),
+            );
+        }
+    }
+
+    /// Get the list of specializations for an engineer.
+    /// Returns an empty Vec if the engineer has no specializations.
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer
+    ///
+    /// # Returns
+    /// A Vec of specialization symbols
+    ///
+    /// # Panics
+    /// - [`ContractError::EngineerNotFound`] if the engineer record does not exist
+    pub fn get_specializations(env: Env, engineer: Address) -> Vec<Symbol> {
+        env.storage()
+            .persistent()
+            .get::<_, Engineer>(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound))
+            .specializations
     }
 }
 
@@ -3748,6 +3914,14 @@ mod tests {
 
     #[test]
     fn test_get_reputation_default_is_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        assert_eq!(client.get_reputation(&engineer), 0);
+    }
+
     // --- Issue #827: get_total_engineer_count ---
 
     #[test]
@@ -3975,5 +4149,461 @@ mod tests {
 
         let record = client.get_engineer(&engineer);
         assert!(record.notes.is_none());
+    }
+
+    // --- Specialization tracking tests ---
+
+    #[test]
+    fn test_add_specialization_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let spec = symbol_short!("diesel_ge");
+        client.add_specialization(&issuer, &engineer, &spec);
+
+        let specs = client.get_specializations(&engineer);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs.get(0).unwrap(), spec);
+    }
+
+    #[test]
+    fn test_add_multiple_specializations() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let spec1 = symbol_short!("diesel_ge");
+        let spec2 = symbol_short!("wind_turb");
+        let spec3 = symbol_short!("solar_pnl");
+
+        client.add_specialization(&issuer, &engineer, &spec1);
+        client.add_specialization(&issuer, &engineer, &spec2);
+        client.add_specialization(&issuer, &engineer, &spec3);
+
+        let specs = client.get_specializations(&engineer);
+        assert_eq!(specs.len(), 3);
+    }
+
+    #[test]
+    fn test_add_specialization_duplicate_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let spec = symbol_short!("diesel_ge");
+        client.add_specialization(&issuer, &engineer, &spec);
+
+        let result = client.try_add_specialization(&issuer, &engineer, &spec);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::SpecializationAlreadyExists as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_add_specialization_invalid_spec_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let spec = symbol_short!("invalid_sp");
+        let result = client.try_add_specialization(&issuer, &engineer, &spec);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidSpecialization as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_add_specialization_untrusted_issuer_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let untrusted = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let spec = symbol_short!("diesel_ge");
+        let result = client.try_add_specialization(&untrusted, &engineer, &spec);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UntrustedIssuer as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_add_specialization_wrong_issuer_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer_a = Address::generate(&env);
+        let issuer_b = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer_a);
+        client.add_trusted_issuer(&admin, &issuer_b);
+        client.register_engineer(&engineer, &hash, &issuer_a, &31_536_000, &None);
+
+        let spec = symbol_short!("diesel_ge");
+        let result = client.try_add_specialization(&issuer_b, &engineer, &spec);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_add_specialization_unknown_engineer_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let spec = symbol_short!("diesel_ge");
+        let result = client.try_add_specialization(&issuer, &engineer, &spec);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::EngineerNotFound as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_add_specialization_revoked_engineer_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+        client.revoke_credential(&engineer);
+
+        let spec = symbol_short!("diesel_ge");
+        let result = client.try_add_specialization(&issuer, &engineer, &spec);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::CredentialRevoked as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_remove_specialization_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let spec = symbol_short!("diesel_ge");
+        client.add_specialization(&issuer, &engineer, &spec);
+        assert_eq!(client.get_specializations(&engineer).len(), 1);
+
+        client.remove_specialization(&issuer, &engineer, &spec);
+        assert_eq!(client.get_specializations(&engineer).len(), 0);
+    }
+
+    #[test]
+    fn test_remove_specialization_nonexistent_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let spec = symbol_short!("diesel_ge");
+        client.remove_specialization(&issuer, &engineer, &spec);
+        assert_eq!(client.get_specializations(&engineer).len(), 0);
+    }
+
+    #[test]
+    fn test_remove_specialization_preserves_others() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let spec1 = symbol_short!("diesel_ge");
+        let spec2 = symbol_short!("wind_turb");
+        let spec3 = symbol_short!("solar_pnl");
+
+        client.add_specialization(&issuer, &engineer, &spec1);
+        client.add_specialization(&issuer, &engineer, &spec2);
+        client.add_specialization(&issuer, &engineer, &spec3);
+
+        client.remove_specialization(&issuer, &engineer, &spec2);
+
+        let specs = client.get_specializations(&engineer);
+        assert_eq!(specs.len(), 2);
+        assert!(specs.contains(spec1.clone()));
+        assert!(!specs.contains(spec2.clone()));
+        assert!(specs.contains(spec3.clone()));
+    }
+
+    #[test]
+    fn test_remove_specialization_wrong_issuer_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer_a = Address::generate(&env);
+        let issuer_b = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer_a);
+        client.add_trusted_issuer(&admin, &issuer_b);
+        client.register_engineer(&engineer, &hash, &issuer_a, &31_536_000, &None);
+
+        let spec = symbol_short!("diesel_ge");
+        client.add_specialization(&issuer_a, &engineer, &spec);
+
+        let result = client.try_remove_specialization(&issuer_b, &engineer, &spec);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_get_specializations_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let specs = client.get_specializations(&engineer);
+        assert_eq!(specs.len(), 0);
+    }
+
+    #[test]
+    fn test_get_specializations_unknown_engineer_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let result = client.try_get_specializations(&engineer);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::EngineerNotFound as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_add_specialization_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let spec = symbol_short!("diesel_ge");
+        client.add_specialization(&issuer, &engineer, &spec);
+
+        let events = env.events().all();
+        let add_spec_event = events.iter().find(|(_, topics, _)| {
+            if let Some(val) = topics.get(0) {
+                if let Ok(s) = soroban_sdk::TryIntoVal::<_, soroban_sdk::Symbol>::try_into_val(
+                    &val, &env,
+                ) {
+                    return s == symbol_short!("ADD_SPEC");
+                }
+            }
+            false
+        });
+        assert!(add_spec_event.is_some(), "ADD_SPEC event must be emitted");
+    }
+
+    #[test]
+    fn test_remove_specialization_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let spec = symbol_short!("diesel_ge");
+        client.add_specialization(&issuer, &engineer, &spec);
+        client.remove_specialization(&issuer, &engineer, &spec);
+
+        let events = env.events().all();
+        let rm_spec_event = events.iter().find(|(_, topics, _)| {
+            if let Some(val) = topics.get(0) {
+                if let Ok(s) = soroban_sdk::TryIntoVal::<_, soroban_sdk::Symbol>::try_into_val(
+                    &val, &env,
+                ) {
+                    return s == symbol_short!("RM_SPEC");
+                }
+            }
+            false
+        });
+        assert!(
+            rm_spec_event.is_some(),
+            "RM_SPEC event must be emitted"
+        );
+    }
+
+    #[test]
+    fn test_add_specialization_paused_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+        client.pause(&admin);
+
+        let spec = symbol_short!("diesel_ge");
+        let result = client.try_add_specialization(&issuer, &engineer, &spec);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::Paused as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_all_valid_specializations_accepted() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let valid_specs = [
+            symbol_short!("diesel_ge"),
+            symbol_short!("wind_turb"),
+            symbol_short!("solar_pnl"),
+            symbol_short!("grid_infr"),
+            symbol_short!("gas_turbn"),
+            symbol_short!("hydroelec"),
+            symbol_short!("batteryst"),
+            symbol_short!("transform"),
+        ];
+
+        for spec in valid_specs.iter() {
+            client.add_specialization(&issuer, &engineer, spec);
+        }
+
+        let specs = client.get_specializations(&engineer);
+        assert_eq!(specs.len(), valid_specs.len() as u32);
+    }
+
+    #[test]
+    fn test_register_engineer_initializes_empty_specializations() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let record = client.get_engineer(&engineer);
+        assert_eq!(record.specializations.len(), 0);
     }
 }

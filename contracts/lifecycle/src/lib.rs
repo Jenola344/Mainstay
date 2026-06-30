@@ -266,7 +266,7 @@ fn verify_asset_exists(env: &Env, asset_registry: &Address, asset_id: &u64) {
 
 // Minimal client interface for cross-contract call to EngineerRegistry
 mod engineer_registry {
-    use soroban_sdk::{contractclient, contracttype, Address, Env, Vec};
+    use soroban_sdk::{contractclient, contracttype, Address, Env, Symbol, Vec};
 
     #[contracttype]
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -281,12 +281,11 @@ mod engineer_registry {
     #[allow(dead_code)]
     #[contractclient(name = "EngineerRegistryClient")]
     pub trait EngineerRegistry {
-        fn verify_engineer(env: Env, engineer: Address) -> Option<bool>;
-        fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<bool>;
         fn get_reputation(env: Env, engineer: Address) -> u32;
         fn verify_engineer(env: Env, engineer: Address) -> CredentialStatus;
         fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<CredentialStatus>;
         fn get_credential_status(env: Env, engineer: Address) -> CredentialStatus;
+        fn get_specializations(env: Env, engineer: Address) -> Vec<Symbol>;
     }
 }
 
@@ -1158,11 +1157,27 @@ impl Lifecycle {
         use engineer_registry::CredentialStatus;
         let status = registry.get_credential_status(&engineer);
         if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
-        let status = registry.verify_engineer(&engineer);
-        if status != CredentialStatus::Valid {
-            panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+            let status = registry.verify_engineer(&engineer);
+            if status != CredentialStatus::Valid {
+                panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+            }
         }
         require_engineer_authorized(&env, asset_id, &engineer);
+
+        // Validate engineer specialization matches asset type
+        let asset_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let asset = asset_client.get_asset(&asset_id);
+        let specializations = registry.get_specializations(&engineer);
+        let mut spec_matched = false;
+        for spec in specializations.iter() {
+            if spec == asset.asset_type {
+                spec_matched = true;
+                break;
+            }
+        }
+        if !spec_matched {
+            panic_with_error!(&env, ContractError::SpecializationMismatch);
+        }
 
         let timestamp = env.ledger().timestamp();
 
@@ -1360,11 +1375,27 @@ impl Lifecycle {
         use engineer_registry::CredentialStatus;
         let status = engineer_registry_client.get_credential_status(&engineer);
         if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
-        let status = engineer_registry_client.verify_engineer(&engineer);
-        if status != CredentialStatus::Valid {
-            panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+            let status = engineer_registry_client.verify_engineer(&engineer);
+            if status != CredentialStatus::Valid {
+                panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+            }
         }
         require_engineer_authorized(&env, asset_id, &engineer);
+
+        // Validate engineer specialization matches asset type
+        let asset_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let asset = asset_client.get_asset(&asset_id);
+        let specializations = engineer_registry_client.get_specializations(&engineer);
+        let mut spec_matched = false;
+        for spec in specializations.iter() {
+            if spec == asset.asset_type {
+                spec_matched = true;
+                break;
+            }
+        }
+        if !spec_matched {
+            panic_with_error!(&env, ContractError::SpecializationMismatch);
+        }
 
         let timestamp = env.ledger().timestamp();
         let mut history: Vec<MaintenanceRecord> = env
@@ -8851,6 +8882,8 @@ mod tests {
 
         let result = client.try_take_health_snapshot(&999u64);
         assert!(result.is_err(), "should error for unknown asset");
+    }
+
     // --- Deprecation: collateral score tests ---
 
     #[test]
@@ -8887,6 +8920,8 @@ mod tests {
         assert_eq!(lifecycle.get_collateral_score(&asset_id_1), 0);
         // Asset 2 is active, score is 0 simply because no maintenance has been submitted
         assert_eq!(lifecycle.get_collateral_score(&asset_id_2), 0);
+    }
+
     // --- Issue #830: set_max_notes_length ---
 
     #[test]

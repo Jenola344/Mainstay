@@ -29,4 +29,6 @@ pub enum ContractError {
     NotesTooLong = 20,
     /// Asset score is frozen due to decommission; decay and mutation are blocked.
     ScoreFrozen = 21,
+    /// Engineer does not have a specialization matching the asset type.
+    SpecializationMismatch = 22,
 }
