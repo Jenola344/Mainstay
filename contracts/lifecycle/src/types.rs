@@ -1,6 +1,15 @@
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, String, Symbol, Map};
+use soroban_sdk::{contracttype, Address, String, Symbol, Map, Vec};
+
+/// A single ownership-transfer event recorded in the on-chain transfer history.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferRecord {
+    pub from: Address,
+    pub to: Address,
+    pub timestamp: u64,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,6 +40,12 @@ pub struct BatchRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub admin: Address,
+    /// All addresses eligible to co-sign admin operations.
+    /// When empty, `admin` alone controls all operations (single-admin mode).
+    pub admins: Vec<Address>,
+    /// Minimum number of signatures from `admins` required to execute critical operations.
+    /// Ignored when `admins` is empty (single-admin mode) or when set to 0 / 1.
+    pub admin_threshold: u32,
     pub max_history: u32,
     pub score_increment: u32,
     pub decay_rate: u32,
@@ -45,6 +60,17 @@ pub struct Config {
 pub struct TimelockProposal {
     pub proposed_at: u64,
     pub executed: bool,
+}
+
+/// A point-in-time snapshot of an asset's health, persisted independently of
+/// maintenance history so lenders can verify condition even after TTL-driven pruning.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthSnapshot {
+    pub timestamp: u64,
+    pub score: u32,
+    pub maintenance_count: u32,
+    pub last_service_date: u64,
 }
 
 #[contracttype]
@@ -63,4 +89,6 @@ pub enum DataKey {
     EngineerHistory(Address),
     EngineerAuth(u64, Address),
     Timelock(Symbol),
+    HealthSnapshots(u64),
+    TransferHistory(u64),
 }
