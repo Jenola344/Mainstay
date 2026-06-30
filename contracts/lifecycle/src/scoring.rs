@@ -21,9 +21,7 @@ pub fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_histo
         if last.timestamp == entry.timestamp {
             history.set(last_idx, entry);
             env.storage().persistent().set(&key, &history);
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+            shared::extend_persistent_ttl(&env, &key);
             return;
         }
     }
@@ -33,9 +31,7 @@ pub fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_histo
     }
     history.push_back(entry);
     env.storage().persistent().set(&key, &history);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+    shared::extend_persistent_ttl(&env, &key);
 }
 
 pub fn get_task_weight(env: &Env, task_type: &Symbol, config: &Config) -> u32 {
@@ -118,14 +114,33 @@ pub fn apply_decay(
         .unwrap_or(0u32);
 
     if current_score == 0 {
-        if env.storage().persistent().has(&super::last_update_key(asset_id)) {
+        // Even if the stored score is already 0, apply the floor: if the asset has
+        // maintenance history it must score at least MIN_SCORE_WITH_HISTORY.
+        let zero_has_history = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<MaintenanceRecord>>(&super::history_key(asset_id))
+            .map(|h: Vec<MaintenanceRecord>| !h.is_empty())
+            .unwrap_or(false);
+        if zero_has_history {
+            let floor = super::MIN_SCORE_WITH_HISTORY;
+            env.storage()
+                .persistent()
+                .set(&super::score_key(asset_id), &floor);
             env.storage().persistent().extend_ttl(
-                &super::last_update_key(asset_id),
+                &super::score_key(asset_id),
                 super::TTL_THRESHOLD,
                 super::TTL_TARGET,
             );
         }
-        return 0;
+        if env.storage().persistent().has(&super::last_update_key(asset_id)) {
+            shared::extend_persistent_ttl(&env, &super::last_update_key(asset_id));
+        }
+        return if zero_has_history {
+            super::MIN_SCORE_WITH_HISTORY
+        } else {
+            0
+        };
     }
 
     let last_update: u64 = env
@@ -144,32 +159,38 @@ pub fn apply_decay(
     let time_elapsed = current_time.saturating_sub(last_update);
     let decay_intervals = time_elapsed / config.decay_interval;
     if decay_intervals == 0 && !update_on_zero_interval {
-        env.storage()
-            .persistent()
-            .extend_ttl(&super::score_key(asset_id), super::TTL_THRESHOLD, super::TTL_TARGET);
-        env.storage().persistent().extend_ttl(
-            &super::last_update_key(asset_id),
-            super::TTL_THRESHOLD,
-            super::TTL_TARGET,
-        );
+        shared::extend_persistent_ttl(&env, &super::score_key(asset_id));
+        shared::extend_persistent_ttl(&env, &super::last_update_key(asset_id));
         return current_score;
     }
 
     let total_decay = (decay_intervals as u32) * config.decay_rate;
-    let new_score = current_score.saturating_sub(total_decay);
+    let raw_score = current_score.saturating_sub(total_decay);
+
+    // Enforce floor: an asset with at least one maintenance record must never score
+    // below MIN_SCORE_WITH_HISTORY (= 1) so it remains distinguishable from an asset
+    // that has never been maintained.  Check the maintenance history, not the score
+    // history, so the floor is tied to real maintenance events.
+    let has_history = env
+        .storage()
+        .persistent()
+        .get::<_, Vec<MaintenanceRecord>>(&super::history_key(asset_id))
+        .map(|h: Vec<MaintenanceRecord>| !h.is_empty())
+        .unwrap_or(false);
+    let new_score = if has_history && raw_score < super::MIN_SCORE_WITH_HISTORY {
+        super::MIN_SCORE_WITH_HISTORY
+    } else {
+        raw_score
+    };
 
     env.storage()
         .persistent()
         .set(&super::score_key(asset_id), &new_score);
-    env.storage()
-        .persistent()
-        .extend_ttl(&super::score_key(asset_id), super::TTL_THRESHOLD, super::TTL_TARGET);
+    shared::extend_persistent_ttl(&env, &super::score_key(asset_id));
     env.storage()
         .persistent()
         .set(&super::last_update_key(asset_id), &current_time);
-    env.storage()
-        .persistent()
-        .extend_ttl(&super::last_update_key(asset_id), super::TTL_THRESHOLD, super::TTL_TARGET);
+    shared::extend_persistent_ttl(&env, &super::last_update_key(asset_id));
 
     score_history_push(
         env,
