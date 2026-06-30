@@ -39,6 +39,9 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
+      - name: Run clippy lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   audit:
     name: Dependency Audit
     runs-on: ubuntu-latest
