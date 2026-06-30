@@ -23,3 +23,5 @@ pub fn submit_maintenance(e: Env, collateral_id: u64) -> Result<(), ContractErro
 pub fn get_collateral_score(e: Env, collateral_id: u64) -> i128 {
     0 // Implementation here
 }
+#[cfg(test)]
+mod fuzz_tests;
