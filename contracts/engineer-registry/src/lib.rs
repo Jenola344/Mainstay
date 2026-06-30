@@ -63,6 +63,7 @@ pub struct Engineer {
     pub suspension_end_time: Option<u64>,
     pub reputation_score: u32,
     pub notes: Option<soroban_sdk::String>,
+    pub specializations: Vec<Symbol>,
 }
 
 #[contracttype]
@@ -319,6 +320,7 @@ impl EngineerRegistry {
             suspension_end_time: None,
             reputation_score: 0,
             notes,
+            specializations: Vec::new(&env),
         };
         env.storage()
             .persistent()
@@ -1405,6 +1407,167 @@ impl EngineerRegistry {
             .get::<_, Engineer>(&engineer_key(&engineer))
             .map(|e| e.reputation_score)
             .unwrap_or(0)
+    }
+
+    /// Add a specialization to an engineer's profile.
+    /// Only the engineer's original issuer can modify specializations.
+    ///
+    /// # Arguments
+    /// * `issuer` - The issuer address (must match the engineer's original issuer)
+    /// * `engineer` - The address of the engineer
+    /// * `specialization` - The specialization symbol (must be a valid allowed value)
+    ///
+    /// # Panics
+    /// - [`ContractError::EngineerNotFound`] if the engineer record does not exist
+    /// - [`ContractError::UntrustedIssuer`] if the issuer is not trusted
+    /// - [`ContractError::UnauthorizedAdmin`] if the caller is not the engineer's original issuer
+    /// - [`ContractError::InvalidSpecialization`] if the specialization is not in the allowed list
+    /// - [`ContractError::SpecializationAlreadyExists`] if the engineer already has this specialization
+    /// - [`ContractError::CredentialRevoked`] if the engineer's credential has been revoked
+    pub fn add_specialization(
+        env: Env,
+        issuer: Address,
+        engineer: Address,
+        specialization: Symbol,
+    ) {
+        ensure_not_paused(&env);
+        issuer.require_auth();
+        if !env.storage().instance().has(&trusted_key(&issuer)) {
+            panic_with_error!(&env, ContractError::UntrustedIssuer);
+        }
+
+        let allowed_specs: [Symbol; 8] = [
+            symbol_short!("diesel_ge"),
+            symbol_short!("wind_turb"),
+            symbol_short!("solar_pnl"),
+            symbol_short!("grid_infr"),
+            symbol_short!("gas_turbn"),
+            symbol_short!("hydroelec"),
+            symbol_short!("batteryst"),
+            symbol_short!("transform"),
+        ];
+        let mut found = false;
+        for allowed in allowed_specs.iter() {
+            if *allowed == specialization {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            panic_with_error!(&env, ContractError::InvalidSpecialization);
+        }
+
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+
+        if record.issuer != issuer {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if !record.active {
+            panic_with_error!(&env, ContractError::CredentialRevoked);
+        }
+
+        for spec in record.specializations.iter() {
+            if spec == specialization {
+                panic_with_error!(&env, ContractError::SpecializationAlreadyExists);
+            }
+        }
+
+        record.specializations.push_back(specialization.clone());
+        env.storage()
+            .persistent()
+            .set(&engineer_key(&engineer), &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("ADD_SPEC"), engineer.clone()),
+            (specialization,),
+        );
+    }
+
+    /// Remove a specialization from an engineer's profile.
+    /// Only the engineer's original issuer can modify specializations.
+    /// Silently succeeds if the specialization does not exist.
+    ///
+    /// # Arguments
+    /// * `issuer` - The issuer address (must match the engineer's original issuer)
+    /// * `engineer` - The address of the engineer
+    /// * `specialization` - The specialization symbol to remove
+    ///
+    /// # Panics
+    /// - [`ContractError::EngineerNotFound`] if the engineer record does not exist
+    /// - [`ContractError::UntrustedIssuer`] if the issuer is not trusted
+    /// - [`ContractError::UnauthorizedAdmin`] if the caller is not the engineer's original issuer
+    pub fn remove_specialization(
+        env: Env,
+        issuer: Address,
+        engineer: Address,
+        specialization: Symbol,
+    ) {
+        ensure_not_paused(&env);
+        issuer.require_auth();
+        if !env.storage().instance().has(&trusted_key(&issuer)) {
+            panic_with_error!(&env, ContractError::UntrustedIssuer);
+        }
+
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+
+        if record.issuer != issuer {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        let mut new_specs: Vec<Symbol> = Vec::new(&env);
+        let mut found = false;
+        for spec in record.specializations.iter() {
+            if spec == specialization {
+                found = true;
+            } else {
+                new_specs.push_back(spec);
+            }
+        }
+
+        if found {
+            record.specializations = new_specs;
+            env.storage()
+                .persistent()
+                .set(&engineer_key(&engineer), &record);
+            env.storage()
+                .persistent()
+                .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+
+            env.events().publish(
+                (symbol_short!("RM_SPEC"), engineer.clone()),
+                (specialization,),
+            );
+        }
+    }
+
+    /// Get the list of specializations for an engineer.
+    /// Returns an empty Vec if the engineer has no specializations.
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer
+    ///
+    /// # Returns
+    /// A Vec of specialization symbols
+    ///
+    /// # Panics
+    /// - [`ContractError::EngineerNotFound`] if the engineer record does not exist
+    pub fn get_specializations(env: Env, engineer: Address) -> Vec<Symbol> {
+        env.storage()
+            .persistent()
+            .get::<_, Engineer>(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound))
+            .specializations
     }
 }
 

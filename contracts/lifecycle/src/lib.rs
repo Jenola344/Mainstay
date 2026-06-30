@@ -487,7 +487,7 @@ fn verify_asset_exists(env: &Env, asset_registry: &Address, asset_id: &u64) {
 
 // Minimal client interface for cross-contract call to EngineerRegistry
 mod engineer_registry {
-    use soroban_sdk::{contractclient, contracttype, Address, Env, Vec};
+    use soroban_sdk::{contractclient, contracttype, Address, Env, Symbol, Vec};
 
     #[contracttype]
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -506,6 +506,7 @@ mod engineer_registry {
         fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<CredentialStatus>;
         fn get_reputation(env: Env, engineer: Address) -> u32;
         fn get_credential_status(env: Env, engineer: Address) -> CredentialStatus;
+        fn get_specializations(env: Env, engineer: Address) -> Vec<Symbol>;
     }
 }
 
@@ -1507,6 +1508,21 @@ impl Lifecycle {
         }
         require_engineer_authorized(&env, asset_id, &engineer);
 
+        // Validate engineer specialization matches asset type
+        let asset_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let asset = asset_client.get_asset(&asset_id);
+        let specializations = registry.get_specializations(&engineer);
+        let mut spec_matched = false;
+        for spec in specializations.iter() {
+            if spec == asset.asset_type {
+                spec_matched = true;
+                break;
+            }
+        }
+        if !spec_matched {
+            panic_with_error!(&env, ContractError::SpecializationMismatch);
+        }
+
         let timestamp = env.ledger().timestamp();
 
         let record = MaintenanceRecord {
@@ -1756,6 +1772,21 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
         require_engineer_authorized(&env, asset_id, &engineer);
+
+        // Validate engineer specialization matches asset type
+        let asset_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let asset = asset_client.get_asset(&asset_id);
+        let specializations = engineer_registry_client.get_specializations(&engineer);
+        let mut spec_matched = false;
+        for spec in specializations.iter() {
+            if spec == asset.asset_type {
+                spec_matched = true;
+                break;
+            }
+        }
+        if !spec_matched {
+            panic_with_error!(&env, ContractError::SpecializationMismatch);
+        }
 
         let timestamp = env.ledger().timestamp();
         let mut history: Vec<MaintenanceRecord> = env
