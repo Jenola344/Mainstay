@@ -96,6 +96,55 @@ fn revoke_eng_timelock_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, A
     (symbol_short!("RVK_TL"), asset_id, engineer.clone())
 }
 
+/// Enforce M-of-N admin quorum for critical lifecycle operations.
+///
+/// When `config.admins` is empty or `admin_threshold <= 1`, only the single
+/// `config.admin` must have signed (single-admin mode, backward-compatible).
+/// Otherwise the caller must be in `config.admins`, and the transaction must
+/// also carry signatures from additional admins in `config.admins` (in order)
+/// until `admin_threshold` total valid signatures are collected.
+///
+/// The `caller` is expected to have already called `caller.require_auth()` before
+/// this function.
+fn require_quorum(env: &Env, config: &Config, caller: &Address) {
+    if config.admins.is_empty() || config.admin_threshold <= 1 {
+        // Single-admin mode: caller must be the configured admin.
+        if config.admin != *caller {
+            panic_with_error!(env, ContractError::UnauthorizedAdmin);
+        }
+        return;
+    }
+
+    // Verify caller is a member of the multisig set.
+    let mut caller_found = false;
+    for a in config.admins.iter() {
+        if a == *caller {
+            caller_found = true;
+            break;
+        }
+    }
+    if !caller_found {
+        panic_with_error!(env, ContractError::UnauthorizedAdmin);
+    }
+
+    // Require auth from additional admins (in order) until threshold is met.
+    // Caller already signed, so we start counting from 1.
+    let mut collected: u32 = 1;
+    for a in config.admins.iter() {
+        if collected >= config.admin_threshold {
+            break;
+        }
+        if a != *caller {
+            a.require_auth();
+            collected += 1;
+        }
+    }
+
+    if collected < config.admin_threshold {
+        panic_with_error!(env, ContractError::InsufficientSigners);
+    }
+}
+
 fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
     let authorized: bool = env
         .storage()
@@ -591,6 +640,8 @@ impl Lifecycle {
 
         let config = Config {
             admin: admin.clone(),
+            admins: Vec::new(&env),
+            admin_threshold: 0,
             max_history: if max_history == 0 {
                 DEFAULT_MAX_HISTORY
             } else {
@@ -627,9 +678,7 @@ impl Lifecycle {
             .persistent()
             .get(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
+        require_quorum(&env, &config, &admin);
         env.storage().persistent().set(&PAUSED_KEY, &true);
         env.storage()
             .persistent()
@@ -743,6 +792,54 @@ impl Lifecycle {
             (pending_admin.clone(), env.ledger().timestamp()),
         );
         env.events().publish((EVENT_ADMIN_SET,), (pending_admin,));
+    }
+
+    /// Admin-only function to configure the M-of-N multisig set for critical operations.
+    ///
+    /// Sets the list of co-signers and the minimum number of signatures required to execute
+    /// `reset_score`, `pause`, and other protected admin operations. Passing an empty
+    /// `new_admins` or a `threshold` of 0 / 1 reverts to single-admin mode.
+    ///
+    /// # Arguments
+    /// * `admin` - The current single admin (must match `config.admin`)
+    /// * `new_admins` - Full replacement list of multisig co-signer addresses
+    /// * `threshold` - Minimum signatures required (M in M-of-N); 0 means single-admin mode
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::InvalidConfig`] if threshold exceeds the length of new_admins
+    pub fn set_admin_quorum(env: Env, admin: Address, new_admins: Vec<Address>, threshold: u32) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let mut config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if threshold > 0 && threshold as u32 > new_admins.len() {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+
+        config.admins = new_admins.clone();
+        config.admin_threshold = threshold;
+        env.storage().persistent().set(&CONFIG, &config);
+        env.storage()
+            .persistent()
+            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("SET_QRUM"), admin.clone()),
+            (new_admins, threshold),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("SET_QRUM")),
+            (admin, env.ledger().timestamp(), threshold),
+        );
     }
 
     /// Admin-only function to update the score increment configuration.
@@ -1733,24 +1830,45 @@ impl Lifecycle {
         results
     }
 
-    /// Returns the full score trend: one (timestamp, score) entry per maintenance event.
-    /// Get the complete score history for an asset.
-    /// Returns one (timestamp, score) entry per maintenance event.
+    /// Returns the full score history (SCHIST) for an asset.
     ///
     /// # Arguments
     /// * `asset_id` - The unique identifier of the asset
+    /// * `offset` - Zero-based start index for pagination
+    /// * `limit` - Maximum number of entries to return (returns empty vec if 0)
     ///
     /// # Returns
-    /// Vec of ScoreEntry containing the complete score trend
+    /// Vec of [`ScoreEntry`] containing the requested page of the score history
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
-    pub fn get_score_history(env: Env, asset_id: u64) -> Vec<ScoreEntry> {
-        env.storage()
+    pub fn get_score_history(env: Env, asset_id: u64, offset: u32, limit: u32) -> Vec<ScoreEntry> {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let history: Vec<ScoreEntry> = env
+            .storage()
             .persistent()
             .get(&score_history_key(asset_id))
-            .unwrap_or(Vec::new(&env))
+            .unwrap_or(Vec::new(&env));
+
+        let len = history.len();
+        if offset >= len {
+            return Vec::new(&env);
+        }
+
+        let end = (offset + limit).min(len);
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(history.get(i).unwrap());
+        }
+        page
     }
+
 
     /// Get the last `n` ScoreEntry items from the score history.
     /// Useful for displaying recent score trends in dashboards.
@@ -2209,9 +2327,7 @@ impl Lifecycle {
             .persistent()
             .get(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
+        require_quorum(&env, &config, &admin);
 
         let now = env.ledger().timestamp();
         // Clear the maintenance history so compute_decay returns 0 after reset.
@@ -9066,5 +9182,163 @@ mod tests {
                 i, 20 + i,
             );
         }
+    // ── Multisig / quorum tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_single_admin_mode_pause_works_without_quorum() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        // Default config has admins=[] and threshold=0 → single-admin mode
+        let config = lifecycle.get_config();
+        assert_eq!(config.admins.len(), 0);
+        assert_eq!(config.admin_threshold, 0);
+
+        // Single admin can pause without multisig
+        lifecycle.pause(&admin);
+        assert!(lifecycle.is_paused());
+    }
+
+    #[test]
+    fn test_set_admin_quorum_stores_admins_and_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        let co1 = Address::generate(&env);
+        let co2 = Address::generate(&env);
+        let new_admins = soroban_sdk::vec![&env, admin.clone(), co1.clone(), co2.clone()];
+
+        lifecycle.set_admin_quorum(&admin, &new_admins, &2);
+
+        let config = lifecycle.get_config();
+        assert_eq!(config.admin_threshold, 2);
+        assert_eq!(config.admins.len(), 3);
+    }
+
+    #[test]
+    fn test_set_admin_quorum_threshold_exceeds_admins_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        let co1 = Address::generate(&env);
+        let new_admins = soroban_sdk::vec![&env, admin.clone(), co1.clone()];
+
+        // Threshold 5 > len 2 → InvalidConfig
+        let result = lifecycle.try_set_admin_quorum(&admin, &new_admins, &5);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_set_admin_quorum_non_admin_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, _admin) = setup(&env, 0);
+
+        let outsider = Address::generate(&env);
+        let new_admins = soroban_sdk::vec![&env, outsider.clone()];
+
+        let result = lifecycle.try_set_admin_quorum(&outsider, &new_admins, &1);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_quorum_pause_requires_all_threshold_signers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        let co1 = Address::generate(&env);
+        let co2 = Address::generate(&env);
+        let new_admins = soroban_sdk::vec![&env, admin.clone(), co1.clone(), co2.clone()];
+
+        // Set 2-of-3 multisig
+        lifecycle.set_admin_quorum(&admin, &new_admins, &2);
+
+        // With mock_all_auths, all required signers are automatically satisfied
+        // Admin is first in the list; co1 is required as the second signer
+        lifecycle.pause(&admin);
+        assert!(lifecycle.is_paused());
+    }
+
+    #[test]
+    fn test_quorum_reset_score_requires_threshold_signers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, asset_registry, engineer_registry, admin) = setup(&env, 0);
+
+        let co1 = Address::generate(&env);
+        let new_admins = soroban_sdk::vec![&env, admin.clone(), co1.clone()];
+        lifecycle.set_admin_quorum(&admin, &new_admins, &2);
+
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&asset_owner, &asset_id, &engineer);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "first service"),
+            &engineer,
+        );
+
+        let score_before = lifecycle.get_collateral_score(&asset_id);
+        assert!(score_before > 0);
+
+        // With mock_all_auths, both admin and co1 are treated as signed
+        lifecycle.reset_score(&admin, &asset_id);
+        assert_eq!(lifecycle.get_collateral_score(&asset_id), 0);
+    }
+
+    #[test]
+    fn test_quorum_non_member_caller_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        let co1 = Address::generate(&env);
+        let new_admins = soroban_sdk::vec![&env, admin.clone(), co1.clone()];
+        lifecycle.set_admin_quorum(&admin, &new_admins, &2);
+
+        let outsider = Address::generate(&env);
+        let result = lifecycle.try_pause(&outsider);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_revert_to_single_admin_by_clearing_quorum() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, _, _, admin) = setup(&env, 0);
+
+        let co1 = Address::generate(&env);
+        let new_admins = soroban_sdk::vec![&env, admin.clone(), co1.clone()];
+        lifecycle.set_admin_quorum(&admin, &new_admins, &2);
+
+        // Clear quorum → back to single-admin mode
+        lifecycle.set_admin_quorum(&admin, &soroban_sdk::vec![&env], &0);
+        let config = lifecycle.get_config();
+        assert_eq!(config.admin_threshold, 0);
+        assert_eq!(config.admins.len(), 0);
+
+        // Single admin can pause alone again
+        lifecycle.pause(&admin);
+        assert!(lifecycle.is_paused());
     }
 }
