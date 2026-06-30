@@ -10,11 +10,14 @@ use crate::types::{
     BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, ScoreEntry, TimelockProposal,
     TransferRecord,
 };
+use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, Address, BytesN, Env, String, Symbol,
     Vec, Map,
 };
+
+pub use shared::error::SharedContractError as SharedError;
 
 const ASSET_REGISTRY: Symbol = symbol_short!("REGISTRY");
 const ENG_REGISTRY: Symbol = symbol_short!("ENG_REG");
@@ -48,11 +51,6 @@ const EVENT_XFER: Symbol = symbol_short!("XFER");
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 const EVENT_ADMIN_SET: Symbol = symbol_short!("ADMIN_SET");
 const EVENT_PRUNED: Symbol = symbol_short!("PRUNED");
-
-/// Soroban persistent-storage TTL constants.
-/// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
-const TTL_THRESHOLD: u32 = 518_400;
-const TTL_TARGET: u32 = 518_400;
 
 fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
@@ -186,9 +184,7 @@ fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_histor
     }
 
     env.storage().persistent().set(&key, &ids);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &key);
 }
 
 fn engineer_history_remove(env: &Env, engineer: &Address, asset_id: u64) {
@@ -202,9 +198,7 @@ fn engineer_history_remove(env: &Env, engineer: &Address, asset_id: u64) {
         }
         if new_ids.len() < ids.len() {
             env.storage().persistent().set(&key, &new_ids);
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+            extend_persistent_ttl(&env, &key);
         }
     }
 }
@@ -225,16 +219,12 @@ fn get_engineer_registry_addr(env: &Env) -> Address {
 
 fn set_asset_registry_addr(env: &Env, addr: &Address) {
     env.storage().persistent().set(&ASSET_REGISTRY, addr);
-    env.storage()
-        .persistent()
-        .extend_ttl(&ASSET_REGISTRY, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &ASSET_REGISTRY);
 }
 
 fn set_engineer_registry_addr(env: &Env, addr: &Address) {
     env.storage().persistent().set(&ENG_REGISTRY, addr);
-    env.storage()
-        .persistent()
-        .extend_ttl(&ENG_REGISTRY, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &ENG_REGISTRY);
 }
 
 fn is_zero_address(env: &Env, addr: &Address) -> bool {
@@ -276,9 +266,7 @@ fn store_timelock(env: &Env, op: Symbol) {
             executed: false,
         },
     );
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &key);
 }
 
 fn require_timelock_ready(env: &Env, op: Symbol) {
@@ -296,9 +284,7 @@ fn require_timelock_ready(env: &Env, op: Symbol) {
     }
     proposal.executed = true;
     env.storage().persistent().set(&key, &proposal);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &key);
 }
 
 fn validate_notes_length(env: &Env, notes: &soroban_sdk::String, max: u32) {
@@ -462,9 +448,7 @@ impl Lifecycle {
 
         let key = engineer_auth_key(asset_id, &engineer);
         env.storage().persistent().set(&key, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &key);
     }
 
     /// Revoke an engineer's owner-approved authorization for a specific asset.
@@ -500,9 +484,7 @@ impl Lifecycle {
                 executed: false,
             },
         );
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &key);
 
         env.events().publish(
             (symbol_short!("PROP_RVK"), owner.clone()),
@@ -547,9 +529,7 @@ impl Lifecycle {
         }
         proposal.executed = true;
         env.storage().persistent().set(&key, &proposal);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &key);
 
         env.storage()
             .persistent()
@@ -660,9 +640,7 @@ impl Lifecycle {
             task_weights: Map::new(&env),
         };
         env.storage().persistent().set(&CONFIG, &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &CONFIG);
 
         env.events()
             .publish((EVENT_INIT,), (asset_registry, engineer_registry, admin));
@@ -685,9 +663,7 @@ impl Lifecycle {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
         require_quorum(&env, &config, &admin);
         env.storage().persistent().set(&PAUSED_KEY, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &PAUSED_KEY);
         env.events()
             .publish((symbol_short!("PAUSED"),), (admin.clone(),));
         env.events().publish(
@@ -715,9 +691,7 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().persistent().set(&PAUSED_KEY, &false);
-        env.storage()
-            .persistent()
-            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &PAUSED_KEY);
         env.events()
             .publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
         env.events().publish(
@@ -788,9 +762,7 @@ impl Lifecycle {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
         config.admin = pending_admin.clone();
         env.storage().persistent().set(&CONFIG, &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &CONFIG);
         env.storage().instance().remove(&PENDING_ADMIN_KEY);
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("ADMIN_SET")),
@@ -878,9 +850,7 @@ impl Lifecycle {
         let old_increment = config.score_increment;
         config.score_increment = score_increment;
         env.storage().persistent().set(&CONFIG, &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &CONFIG);
         env.events().publish(
             (symbol_short!("CFG_UPD"),),
             (old_increment, score_increment),
@@ -940,9 +910,7 @@ impl Lifecycle {
             ),
         );
         env.storage().persistent().set(&CONFIG, &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &CONFIG);
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
             (
@@ -984,9 +952,7 @@ impl Lifecycle {
         let old_threshold = config.eligibility_threshold;
         config.eligibility_threshold = threshold;
         env.storage().persistent().set(&CONFIG, &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &CONFIG);
         env.events()
             .publish((symbol_short!("CFG_UPD"),), (old_threshold, threshold));
         env.events().publish(
@@ -1036,9 +1002,7 @@ impl Lifecycle {
 
         config.max_history = new_max;
         env.storage().persistent().set(&CONFIG, &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &CONFIG);
 
         env.events()
             .publish((symbol_short!("UPD_MAX"), admin.clone()), new_max);
@@ -1082,9 +1046,7 @@ impl Lifecycle {
 
         config.max_notes_length = new_max;
         env.storage().persistent().set(&CONFIG, &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &CONFIG);
 
         env.events()
             .publish((symbol_short!("UPD_NOTES"), admin.clone()), new_max);
@@ -1130,9 +1092,7 @@ impl Lifecycle {
 
         config.max_notes_length = length;
         env.storage().persistent().set(&CONFIG, &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &CONFIG);
 
         env.events()
             .publish((symbol_short!("SET_NOTES"), admin.clone()), length);
@@ -1178,9 +1138,7 @@ impl Lifecycle {
 
         config.task_weights.set(task_type.clone(), weight);
         env.storage().persistent().set(&CONFIG, &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &CONFIG);
 
         env.events()
             .publish((symbol_short!("TSK_WT"),), (task_type.clone(), weight));
@@ -1280,9 +1238,7 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .set(&history_key(asset_id), &history);
-        env.storage()
-            .persistent()
-            .extend_ttl(&history_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &history_key(asset_id));
 
         engineer_history_add(&env, &engineer, asset_id, config.max_history);
 
@@ -1300,7 +1256,7 @@ impl Lifecycle {
 
         // Persist the accumulated score so apply_decay / get_collateral_score can read it.
         env.storage().persistent().set(&score_key(asset_id), &new_score);
-        env.storage().persistent().extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &score_key(asset_id));
 
         // Append (timestamp, score) snapshot to score history for historical tracking
         score_history_push(
@@ -1317,11 +1273,7 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .set(&last_update_key(asset_id), &timestamp);
-        env.storage().persistent().extend_ttl(
-            &last_update_key(asset_id),
-            TTL_THRESHOLD,
-            TTL_TARGET,
-        );
+        extend_persistent_ttl(&env, &last_update_key(asset_id));
 
         // Emit maintenance submission event
         env.events().publish(
@@ -1405,9 +1357,7 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .set(&history_key(asset_id), &history);
-        env.storage()
-            .persistent()
-            .extend_ttl(&history_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &history_key(asset_id));
 
         // Append to the dedicated transfer history for provenance verification.
         let xfer_key = transfer_hist_key(asset_id);
@@ -1570,21 +1520,13 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .set(&history_key(asset_id), &history);
-        env.storage()
-            .persistent()
-            .extend_ttl(&history_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &history_key(asset_id));
         env.storage().persistent().set(&score_key(asset_id), &score);
-        env.storage()
-            .persistent()
-            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &score_key(asset_id));
         env.storage()
             .persistent()
             .set(&last_update_key(asset_id), &timestamp);
-        env.storage().persistent().extend_ttl(
-            &last_update_key(asset_id),
-            TTL_THRESHOLD,
-            TTL_TARGET,
-        );
+        extend_persistent_ttl(&env, &last_update_key(asset_id));
     }
 
     /// Apply time-based decay to an asset's collateral score.
@@ -1640,15 +1582,11 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .set(&frozen_score_key(asset_id), &frozen_score);
-        env.storage()
-            .persistent()
-            .extend_ttl(&frozen_score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &frozen_score_key(asset_id));
         env.storage()
             .persistent()
             .set(&frozen_key(asset_id), &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&frozen_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &frozen_key(asset_id));
 
         env.events()
             .publish((symbol_short!("DECOMM"), asset_id), frozen_score);
@@ -1837,15 +1775,11 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .set(&score_key(asset_id), &final_score);
-        env.storage()
-            .persistent()
-            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &score_key(asset_id));
         env.storage()
             .persistent()
             .set(&last_update_key(asset_id), &env.ledger().timestamp());
-        env.storage()
-            .persistent()
-            .extend_ttl(&last_update_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &last_update_key(asset_id));
         final_score
     }
 
@@ -2300,9 +2234,7 @@ impl Lifecycle {
         env.storage()
             .persistent()
             .set(&symbol_short!("PEND_UPG"), &new_wasm_hash);
-        env.storage()
-            .persistent()
-            .extend_ttl(&symbol_short!("PEND_UPG"), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &symbol_short!("PEND_UPG"));
 
         env.events().publish(
             (symbol_short!("PROP_UPG"), admin.clone()),
@@ -2382,19 +2314,13 @@ impl Lifecycle {
         // Clear the maintenance history so compute_decay returns 0 after reset.
         let empty_history: Vec<MaintenanceRecord> = Vec::new(&env);
         env.storage().persistent().set(&history_key(asset_id), &empty_history);
-        env.storage().persistent().extend_ttl(&history_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &history_key(asset_id));
         env.storage().persistent().set(&score_key(asset_id), &0u32);
-        env.storage()
-            .persistent()
-            .extend_ttl(&score_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &score_key(asset_id));
         env.storage()
             .persistent()
             .set(&last_update_key(asset_id), &now);
-        env.storage().persistent().extend_ttl(
-            &last_update_key(asset_id),
-            TTL_THRESHOLD,
-            TTL_TARGET,
-        );
+        extend_persistent_ttl(&env, &last_update_key(asset_id));
         score_history_push(
             &env,
             asset_id,
@@ -2484,9 +2410,7 @@ impl Lifecycle {
                     pruned.push_back(history.get(i).unwrap());
                 }
                 env.storage().persistent().set(&history_key, &pruned);
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&history_key, TTL_THRESHOLD, TTL_TARGET);
+                extend_persistent_ttl(&env, &history_key);
 
                 // Remove asset from engineer index for engineers whose records were
                 // entirely dropped (i.e. they appear only in the pruned prefix).
@@ -2549,11 +2473,7 @@ impl Lifecycle {
                 env.storage()
                     .persistent()
                     .set(&score_history_key_val, &pruned);
-                env.storage().persistent().extend_ttl(
-                    &score_history_key_val,
-                    TTL_THRESHOLD,
-                    TTL_TARGET,
-                );
+                extend_persistent_ttl(&env, &score_history_key_val);
             }
         }
 
@@ -2716,9 +2636,7 @@ impl Lifecycle {
             .unwrap_or_else(|| Vec::new(&env));
         snapshots.push_back(snapshot.clone());
         env.storage().persistent().set(&key, &snapshots);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &key);
 
         snapshot
     }

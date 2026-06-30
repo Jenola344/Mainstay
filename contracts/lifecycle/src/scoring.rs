@@ -21,9 +21,7 @@ pub fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_histo
         if last.timestamp == entry.timestamp {
             history.set(last_idx, entry);
             env.storage().persistent().set(&key, &history);
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+            shared::extend_persistent_ttl(&env, &key);
             return;
         }
     }
@@ -33,9 +31,7 @@ pub fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_histo
     }
     history.push_back(entry);
     env.storage().persistent().set(&key, &history);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+    shared::extend_persistent_ttl(&env, &key);
 }
 
 pub fn get_task_weight(env: &Env, task_type: &Symbol, config: &Config) -> u32 {
@@ -119,11 +115,7 @@ pub fn apply_decay(
 
     if current_score == 0 {
         if env.storage().persistent().has(&super::last_update_key(asset_id)) {
-            env.storage().persistent().extend_ttl(
-                &super::last_update_key(asset_id),
-                super::TTL_THRESHOLD,
-                super::TTL_TARGET,
-            );
+            shared::extend_persistent_ttl(&env, &super::last_update_key(asset_id));
         }
         return 0;
     }
@@ -144,14 +136,8 @@ pub fn apply_decay(
     let time_elapsed = current_time.saturating_sub(last_update);
     let decay_intervals = time_elapsed / config.decay_interval;
     if decay_intervals == 0 && !update_on_zero_interval {
-        env.storage()
-            .persistent()
-            .extend_ttl(&super::score_key(asset_id), super::TTL_THRESHOLD, super::TTL_TARGET);
-        env.storage().persistent().extend_ttl(
-            &super::last_update_key(asset_id),
-            super::TTL_THRESHOLD,
-            super::TTL_TARGET,
-        );
+        shared::extend_persistent_ttl(&env, &super::score_key(asset_id));
+        shared::extend_persistent_ttl(&env, &super::last_update_key(asset_id));
         return current_score;
     }
 
@@ -161,15 +147,11 @@ pub fn apply_decay(
     env.storage()
         .persistent()
         .set(&super::score_key(asset_id), &new_score);
-    env.storage()
-        .persistent()
-        .extend_ttl(&super::score_key(asset_id), super::TTL_THRESHOLD, super::TTL_TARGET);
+    shared::extend_persistent_ttl(&env, &super::score_key(asset_id));
     env.storage()
         .persistent()
         .set(&super::last_update_key(asset_id), &current_time);
-    env.storage()
-        .persistent()
-        .extend_ttl(&super::last_update_key(asset_id), super::TTL_THRESHOLD, super::TTL_TARGET);
+    shared::extend_persistent_ttl(&env, &super::last_update_key(asset_id));
 
     score_history_push(
         env,

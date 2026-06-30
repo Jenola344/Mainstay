@@ -1,5 +1,6 @@
 #![no_std]
 
+use shared::error::SharedContractError;
 use soroban_sdk::contracterror;
 
 #[contracterror]
@@ -31,4 +32,18 @@ pub enum ContractError {
     ScoreFrozen = 21,
     /// Fewer valid signers were provided than the configured admin_threshold requires.
     InsufficientSigners = 22,
+}
+
+impl From<SharedContractError> for ContractError {
+    fn from(e: SharedContractError) -> Self {
+        match e {
+            SharedContractError::NotInitialized => ContractError::NotInitialized,
+            SharedContractError::AlreadyInitialized => ContractError::AlreadyInitialized,
+            SharedContractError::UnauthorizedAdmin => ContractError::UnauthorizedAdmin,
+            SharedContractError::Paused => ContractError::Paused,
+            SharedContractError::TimelockNotExpired => ContractError::TimelockNotExpired,
+            SharedContractError::ProposalNotFound => ContractError::ProposalNotFound,
+            SharedContractError::PendingAdminAlreadyExists => ContractError::PendingAdminAlreadyExists,
+        }
+    }
 }
