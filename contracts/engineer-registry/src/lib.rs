@@ -712,8 +712,14 @@ impl EngineerRegistry {
 
     /// Admin-only function to pause the contract.
     ///
+    /// When paused, all state-modifying operations return [`ContractError::Paused`].
+    /// Read-only functions (e.g. [`verify_engineer`], [`get_engineer`]) remain available.
+    ///
     /// # Arguments
     /// * `admin` - The address that must match the stored admin
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if `admin` does not match the stored admin
     pub fn pause(env: Env, admin: Address) {
         admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
@@ -734,8 +740,14 @@ impl EngineerRegistry {
 
     /// Admin-only function to unpause the contract.
     ///
+    /// Resumes normal contract operation after a [`pause`] call. All state-modifying
+    /// functions become available again once unpaused.
+    ///
     /// # Arguments
     /// * `admin` - The address that must match the stored admin
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if `admin` does not match the stored admin
     pub fn unpause(env: Env, admin: Address) {
         admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
@@ -956,7 +968,20 @@ impl EngineerRegistry {
             .unwrap_or(Vec::new(&env))
     }
 
-    /// Get only active, non-expired engineer addresses credentialed by a specific issuer.
+    /// Return only the active, non-expired engineer addresses credentialed by a specific issuer.
+    ///
+    /// Filters the full issuer → engineers list (see [`get_engineers_by_issuer`]) to include
+    /// only engineers whose credentials are currently in [`EngineerStatus::Active`] state —
+    /// i.e. the record exists, `active = true`, and the expiry timestamp has not been reached.
+    ///
+    /// This is a convenience view for issuers who need to audit their live credentialed
+    /// workforce without iterating over revoked or expired entries.
+    ///
+    /// # Arguments
+    /// * `issuer` - The address of the issuer whose active engineers should be listed
+    ///
+    /// # Returns
+    /// A `Vec<Address>` of engineer addresses with currently active credentials (empty if none)
     pub fn get_active_engineers_by_issuer(env: Env, issuer: Address) -> Vec<Address> {
         let engineers = Self::get_engineers_by_issuer(env.clone(), issuer);
         let mut active_engineers = Vec::new(&env);
@@ -968,7 +993,17 @@ impl EngineerRegistry {
         active_engineers
     }
 
-    /// Get the number of engineers credentialed by a specific issuer.
+    /// Return the total number of engineer addresses that have been credentialed by a specific issuer.
+    ///
+    /// Counts both active and revoked/expired engineers — this is a historical count of all
+    /// engineers ever registered under the given issuer, not just currently active ones.
+    /// Use [`get_active_engineers_by_issuer`] to query the live active count.
+    ///
+    /// # Arguments
+    /// * `issuer` - The address of the issuer to query
+    ///
+    /// # Returns
+    /// The total number of engineer addresses (active + inactive) credentialed by this issuer
     pub fn get_engineer_count_by_issuer(env: Env, issuer: Address) -> u32 {
         Self::get_engineers_by_issuer(env, issuer).len()
     }
@@ -1176,10 +1211,22 @@ impl EngineerRegistry {
             .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
     }
 
-    /// Get an engineer's reputation score (0–1000). Returns 0 if not found.
+    /// Get an engineer's current reputation score (range: 0–1000).
+    ///
+    /// Reputation is a weighted signal of an engineer's submission history and is used
+    /// by the lifecycle contract to scale the collateral score increment:
+    /// - `0` → 0.5× multiplier (new or penalised engineer)
+    /// - `500` → 1.0× multiplier (neutral / default)
+    /// - `1000` → 1.5× multiplier (highly reputable engineer)
+    ///
+    /// Returns `0` if the engineer record does not exist rather than panicking, so
+    /// DeFi integrators can safely call this for any address.
     ///
     /// # Arguments
-    /// * `engineer` - The address of the engineer
+    /// * `engineer` - The address of the engineer to query
+    ///
+    /// # Returns
+    /// The engineer's reputation score in the range `[0, 1000]`, or `0` if not found
     pub fn get_reputation(env: Env, engineer: Address) -> u32 {
         env.storage()
             .persistent()

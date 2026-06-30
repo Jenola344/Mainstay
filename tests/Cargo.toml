@@ -34,3 +34,7 @@ path = "test_emergency_pause.rs"
 [[test]]
 name = "test_admin_transfer"
 path = "test_admin_transfer.rs"
+
+[[test]]
+name = "test_paused_contract"
+path = "test_paused_contract.rs"

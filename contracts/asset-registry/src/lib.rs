@@ -720,7 +720,18 @@ impl AssetRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound))
     }
 
-    /// Returns true if an asset with the given ID exists, false otherwise.
+    /// Check whether an asset with the given ID is present in the registry.
+    ///
+    /// This is a lightweight existence check that reads a single persistent storage
+    /// entry and does **not** verify the asset's deprecation or decommission status.
+    /// Use [`get_asset`] if you need the full asset record, or [`asset_status`] if
+    /// you need operational state.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset to check
+    ///
+    /// # Returns
+    /// `true` if a record for `asset_id` exists in persistent storage; `false` otherwise
     pub fn asset_exists(env: Env, asset_id: u64) -> bool {
         env.storage().persistent().has(&asset_key(asset_id))
     }
@@ -769,7 +780,20 @@ impl AssetRegistry {
         AssetStatus::Active
     }
 
-    /// Returns all asset IDs owned by the given address.
+    /// Return all asset IDs currently owned by the given address.
+    ///
+    /// Uses the owner-to-assets index maintained by [`register_asset`] and
+    /// [`transfer_asset`]. The list is updated on every registration and transfer
+    /// so it reflects the owner's current portfolio.
+    ///
+    /// For owners with large portfolios that may exceed return-data limits, prefer
+    /// the paginated variant [`get_assets_by_owner_paginated`].
+    ///
+    /// # Arguments
+    /// * `owner` - The address of the asset owner to query
+    ///
+    /// # Returns
+    /// A `Vec<u64>` of asset IDs owned by `owner` (empty vec if none)
     pub fn get_assets_by_owner(env: Env, owner: Address) -> Vec<u64> {
         let key = owner_index_key(&owner);
         let ids: Vec<u64> = env
@@ -892,7 +916,21 @@ impl AssetRegistry {
         env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0)
     }
 
-    /// Returns all asset IDs of the given type.
+    /// Return all asset IDs that have been registered with the given type symbol.
+    ///
+    /// Uses the type-to-assets index maintained by [`register_asset`] and updated
+    /// on registration and deregistration. The returned list may include deprecated or
+    /// decommissioned assets; callers that need only active assets should filter by
+    /// [`asset_status`] after retrieval.
+    ///
+    /// For large fleets, prefer the paginated variant [`get_assets_by_type_paginated`]
+    /// to avoid exceeding Soroban's return-data limits.
+    ///
+    /// # Arguments
+    /// * `asset_type` - The symbol representing the asset type (e.g., `symbol_short!("GENSET")`)
+    ///
+    /// # Returns
+    /// A `Vec<u64>` of asset IDs of the requested type (empty vec if none)
     pub fn get_assets_by_type(env: Env, asset_type: Symbol) -> Vec<u64> {
         let key = type_assets_key(&asset_type);
         let ids: Vec<u64> = env

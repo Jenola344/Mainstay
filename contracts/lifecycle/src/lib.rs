@@ -8952,4 +8952,235 @@ mod tests {
         });
         assert!(found, "SET_NOTES event not emitted");
     }
+
+    // ── Collateral Score Invariant Tests (Issue #600) ────────────────────────
+    // Property: the collateral score must NEVER exceed the defined maximum (100)
+    // regardless of how many maintenance records are submitted, which task types
+    // are used, or how many engineers contribute.
+
+    /// Helper: register an engineer with a fresh admin/issuer and set neutral reputation.
+    fn register_engineer_for_invariant(
+        env: &Env,
+        eng_registry: &EngineerRegistryClient,
+    ) -> Address {
+        let engineer = Address::generate(env);
+        let issuer = Address::generate(env);
+        let admin = Address::generate(env);
+        let hash = BytesN::from_array(env, &[2u8; 32]);
+        eng_registry.initialize_admin(&admin, &admin);
+        eng_registry.add_trusted_issuer(&admin, &issuer);
+        eng_registry.register_engineer(&engineer, &hash, &issuer, &31_536_000);
+        // Neutral reputation (1.0× multiplier) so tests don't depend on reputation weighting.
+        eng_registry.update_reputation(&engineer, &500);
+        engineer
+    }
+
+    /// Invariant: submitting 100+ maintenance records for a single asset never pushes
+    /// the collateral score above the maximum value of 100.
+    ///
+    /// This is a regression guard for a potential accumulation bug where repeated
+    /// `saturating_add` calls without an explicit cap could return a value > 100.
+    #[test]
+    fn test_collateral_score_never_exceeds_maximum_single_asset() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, eng_registry, _) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let asset_id = asset_registry.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Turbine Alpha"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let engineer = register_engineer_for_invariant(&env, &eng_registry);
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+        // Submit 120 maintenance records — well above any reasonable score cap.
+        for i in 0..120u32 {
+            // Alternate between task types to exercise multiple weight branches.
+            let task = if i % 3 == 0 {
+                symbol_short!("ENGINE")
+            } else if i % 3 == 1 {
+                symbol_short!("FILTER")
+            } else {
+                symbol_short!("OIL_CHG")
+            };
+            lifecycle.submit_maintenance(
+                &asset_id,
+                &task,
+                &String::from_str(&env, "Invariant test record"),
+                &engineer,
+            );
+            // Advance time by 1 second between submissions so timestamps differ.
+            env.ledger().with_mut(|li| li.timestamp += 1);
+
+            let score = lifecycle.get_collateral_score(&asset_id);
+            assert!(
+                score <= 100,
+                "Score invariant violated after {} submissions: score={} > 100",
+                i + 1,
+                score
+            );
+        }
+
+        // Final assertion: score is still within bounds after all 120 submissions.
+        let final_score = lifecycle.get_collateral_score(&asset_id);
+        assert!(
+            final_score <= 100,
+            "Final collateral score {} exceeds maximum of 100",
+            final_score
+        );
+    }
+
+    /// Invariant: the score cap is enforced for GENSET, ENGINE (high-weight task).
+    /// Using a high-weight task type (weight=10) that would overflow 100 after 10 submissions
+    /// if the cap were not enforced.
+    #[test]
+    fn test_collateral_score_cap_enforced_for_high_weight_tasks() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, eng_registry, _) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let asset_id = asset_registry.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator Beta"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let engineer = register_engineer_for_invariant(&env, &eng_registry);
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+        // ENGINE overhaul has weight=10, so without a cap 11 submissions would yield 110 > 100.
+        for i in 0..15u32 {
+            lifecycle.submit_maintenance(
+                &asset_id,
+                &symbol_short!("ENGINE"),
+                &String::from_str(&env, "Engine overhaul"),
+                &engineer,
+            );
+            env.ledger().with_mut(|li| li.timestamp += 1);
+
+            let score = lifecycle.get_collateral_score(&asset_id);
+            assert!(
+                score <= 100,
+                "Score exceeded 100 after {} ENGINE submissions: score={}",
+                i + 1,
+                score
+            );
+        }
+    }
+
+    /// Invariant: score cap is enforced across multiple asset types.
+    /// Runs the same 100-submission flood across three distinct assets to verify
+    /// the invariant holds regardless of asset identity.
+    #[test]
+    fn test_collateral_score_cap_across_multiple_asset_types() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, eng_registry, admin) = setup(&env, 0);
+
+        // Register TURBINE and VEHICLE asset types in addition to the default GENSET.
+        let asset_admin = asset_registry.get_admin();
+        asset_registry.add_asset_type(&asset_admin, &symbol_short!("TURBINE"));
+        asset_registry.add_asset_type(&asset_admin, &symbol_short!("VEHICLE"));
+
+        let asset_types = [
+            symbol_short!("GENSET"),
+            symbol_short!("TURBINE"),
+            symbol_short!("VEHICLE"),
+        ];
+
+        let engineer = register_engineer_for_invariant(&env, &eng_registry);
+
+        for asset_type in asset_types.iter() {
+            let owner = Address::generate(&env);
+            let asset_id = asset_registry.register_asset(
+                asset_type,
+                &String::from_str(&env, "Multi-type invariant asset"),
+                &unique_serial(&env),
+                &owner,
+            );
+
+            lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+            for i in 0..110u32 {
+                lifecycle.submit_maintenance(
+                    &asset_id,
+                    &symbol_short!("OVERHAUL"),
+                    &String::from_str(&env, "Overhaul record"),
+                    &engineer,
+                );
+                env.ledger().with_mut(|li| li.timestamp += 1);
+
+                let score = lifecycle.get_collateral_score(&asset_id);
+                assert!(
+                    score <= 100,
+                    "Score cap violated for asset type {:?} after {} submissions: score={}",
+                    asset_type,
+                    i + 1,
+                    score
+                );
+            }
+        }
+    }
+
+    /// Invariant: scores for different assets are strictly isolated.
+    /// Flooding one asset with 120 submissions must not affect the score of a second
+    /// asset that received no submissions.
+    #[test]
+    fn test_score_isolation_invariant() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, eng_registry, _) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let asset_a = asset_registry.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Isolation Asset A"),
+            &unique_serial(&env),
+            &owner,
+        );
+        let asset_b = asset_registry.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Isolation Asset B"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let engineer = register_engineer_for_invariant(&env, &eng_registry);
+        lifecycle.authorize_engineer(&owner, &asset_a, &engineer);
+
+        for i in 0..120u32 {
+            lifecycle.submit_maintenance(
+                &asset_a,
+                &symbol_short!("ENGINE"),
+                &String::from_str(&env, "Isolation test"),
+                &engineer,
+            );
+            env.ledger().with_mut(|li| li.timestamp += 1);
+
+            let score_a = lifecycle.get_collateral_score(&asset_a);
+            let score_b = lifecycle.get_collateral_score(&asset_b);
+
+            assert!(
+                score_a <= 100,
+                "Asset A score exceeded 100 after {} submissions: {}",
+                i + 1,
+                score_a
+            );
+            assert_eq!(
+                score_b, 0,
+                "Asset B score must remain 0 when only Asset A receives maintenance, got {}",
+                score_b
+            );
+        }
+    }
 }
