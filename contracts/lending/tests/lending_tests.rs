@@ -21,7 +21,7 @@ fn setup_contract_and_token(env: &Env) -> (Address, Address, Address, Address) {
     let client = LendingContractClient::new(env, &contract_id);
 
     // Initialize lending contract
-    client.initialize(&deployer, &admin, &token_id);
+    client.initialize(&deployer, &admin, &token_id, &0);
 
     (contract_id, token_id, admin, token_admin)
 }
