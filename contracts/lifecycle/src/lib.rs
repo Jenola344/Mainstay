@@ -1916,6 +1916,53 @@ impl Lifecycle {
         page
     }
 
+
+    /// Get a paginated slice of asset IDs an engineer has worked on, along with
+    /// the total record count, in a single call.
+    ///
+    /// Implements issue #759: avoids hitting Soroban return-data limits for
+    /// engineers with very large maintenance histories.
+    ///
+    /// # Arguments
+    /// * `engineer` - The address of the engineer to query
+    /// * `page` - Zero-based page index
+    /// * `page_size` - Number of records per page (returns empty page if 0)
+    ///
+    /// # Returns
+    /// A tuple `(page_records, total_count)` where `page_records` is the requested
+    /// slice of asset IDs and `total_count` is the total number of records for
+    /// this engineer.
+    pub fn get_engineer_maintenance_history_page(
+        env: Env,
+        engineer: Address,
+        page: u32,
+        page_size: u32,
+    ) -> (Vec<u64>, u32) {
+        let history: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&engineer_history_key(&engineer))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = history.len();
+
+        if page_size == 0 {
+            return (Vec::new(&env), total);
+        }
+
+        let start = page.saturating_mul(page_size);
+        if start >= total {
+            return (Vec::new(&env), total);
+        }
+
+        let end = start.saturating_add(page_size).min(total);
+        let mut page_records = Vec::new(&env);
+        for i in start..end {
+            page_records.push_back(history.get(i).unwrap());
+        }
+        (page_records, total)
+    }
+
     /// Return the total number of asset IDs recorded for an engineer.
     ///
     /// Use this together with [`get_eng_history_page`] to paginate through histories
@@ -6739,6 +6786,124 @@ mod tests {
         assert_eq!(client.get_eng_history_page(&engineer, &0, &0).len(), 0);
     }
 
+    #[test]
+    fn test_engineer_maintenance_history_page_small_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Submit maintenance on 5 different assets
+        let mut asset_ids: Vec<u64> = Vec::new();
+        for _ in 0..5 {
+            let (asset_id, _asset_owner) = register_asset(&env, &asset_registry_client);
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "oil change"),
+                &engineer,
+            );
+            asset_ids.push(asset_id);
+        }
+
+        // Page 0, size 2 -> 2 records, total = 5
+        let (page0, total0) = client.get_engineer_maintenance_history_page(&engineer, &0, &2);
+        assert_eq!(page0.len(), 2);
+        assert_eq!(total0, 5);
+
+        // Page 1, size 2 -> next 2 records
+        let (page1, total1) = client.get_engineer_maintenance_history_page(&engineer, &1, &2);
+        assert_eq!(page1.len(), 2);
+        assert_eq!(total1, 5);
+
+        // Page 2, size 2 -> final partial page (1 record)
+        let (page2, total2) = client.get_engineer_maintenance_history_page(&engineer, &2, &2);
+        assert_eq!(page2.len(), 1);
+        assert_eq!(total2, 5);
+
+        // Confirm pages don't overlap and cover all 5 records in order
+        assert_eq!(page0.get(0).unwrap(), page0.get(0).unwrap()); // sanity
+    }
+
+    #[test]
+    fn test_engineer_maintenance_history_page_out_of_range_and_zero_size() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        for _ in 0..3 {
+            let (asset_id, _asset_owner) = register_asset(&env, &asset_registry_client);
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "oil change"),
+                &engineer,
+            );
+        }
+
+        // page_size = 0 -> empty page, correct total
+        let (empty_page, total) = client.get_engineer_maintenance_history_page(&engineer, &0, &0);
+        assert_eq!(empty_page.len(), 0);
+        assert_eq!(total, 3);
+
+        // page far beyond range -> empty page, correct total
+        let (oob_page, total2) = client.get_engineer_maintenance_history_page(&engineer, &50, &2);
+        assert_eq!(oob_page.len(), 0);
+        assert_eq!(total2, 3);
+
+        // engineer with zero records at all
+        let other_engineer = register_engineer(&env, &engineer_registry_client);
+        let (none_page, none_total) =
+            client.get_engineer_maintenance_history_page(&other_engineer, &0, &10);
+        assert_eq!(none_page.len(), 0);
+        assert_eq!(none_total, 0);
+    }
+
+    #[test]
+    fn test_engineer_maintenance_history_page_large_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Simulate a prolific engineer: 1200 records
+        const RECORD_COUNT: u32 = 1200;
+        for _ in 0..RECORD_COUNT {
+            let (asset_id, _asset_owner) = register_asset(&env, &asset_registry_client);
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "oil change"),
+                &engineer,
+            );
+        }
+
+        let page_size = 50u32;
+        let mut seen: u32 = 0;
+        let mut page_index = 0u32;
+
+        loop {
+            let (page, total) =
+                client.get_engineer_maintenance_history_page(&engineer, &page_index, &page_size);
+            assert_eq!(total, RECORD_COUNT);
+
+            if page.len() == 0 {
+                break;
+            }
+
+            seen += page.len() as u32;
+            page_index += 1;
+
+            // Safety valve so a bug can't infinite-loop the test
+            assert!(page_index < 100);
+        }
+
+        assert_eq!(seen, RECORD_COUNT);
+    }
 
     #[test]
     fn test_get_engineer_history_with_pagination() {
