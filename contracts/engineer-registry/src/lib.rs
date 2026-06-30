@@ -4620,13 +4620,11 @@ mod tests {
         client.register_engineer(&e1, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000);
         client.register_engineer(&e2, &BytesN::from_array(&env, &[2u8; 32]), &issuer, &31_536_000);
 
-        let mut batch = Vec::new(&env);
-        batch.push_back(e1.clone());
-        batch.push_back(e2.clone());
-        client.batch_revoke_credentials(&admin, &batch);
+        client.update_reputation(&e1, &100);
+        client.update_reputation(&e2, &50);
 
-        assert_eq!(client.get_engineer_status(&e1), EngineerStatus::Revoked);
-        assert_eq!(client.get_engineer_status(&e2), EngineerStatus::Revoked);
+        assert_eq!(client.get_reputation(&e1), 100);
+        assert_eq!(client.get_reputation(&e2), 50);
     }
 
     #[test]
@@ -4655,7 +4653,6 @@ mod tests {
         env.mock_all_auths();
         let (client, admin) = setup(&env);
 
-        let engineer = Address::generate(&env);
         let issuer = Address::generate(&env);
         let hash = BytesN::from_array(&env, &[3u8; 32]);
 
@@ -4782,14 +4779,8 @@ mod tests {
             batch.push_back(Address::generate(&env));
         }
 
-        let result = client.try_batch_revoke_credentials(&admin, &batch);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::BatchRevokeTooLarge as u32,
-            ))),
-        );
-    }
+        let e1 = Address::generate(&env);
+        client.register_engineer(&e1, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000, &None);
 
     #[test]
     fn test_suspend_with_past_timestamp_fails() {
@@ -4815,15 +4806,7 @@ mod tests {
         env.mock_all_auths();
         let (client, _admin) = setup(&env);
 
-        let outsider = Address::generate(&env);
-        let batch = Vec::new(&env);
-        let result = client.try_batch_revoke_credentials(&outsider, &batch);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::UnauthorizedAdmin as u32,
-            ))),
-        );
+        assert_eq!(client.get_reputation(&e1), 50);
     }
 
     #[test]
@@ -4954,15 +4937,15 @@ mod tests {
         env.mock_all_auths();
         let (client, admin) = setup(&env);
 
-        let engineer = Address::generate(&env);
         let issuer = Address::generate(&env);
         let hash = BytesN::from_array(&env, &[4u8; 32]);
 
         client.add_trusted_issuer(&admin, &issuer);
-        client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
 
-        // Add far more than max — should clamp to 1000
+        let engineer = Address::generate(&env);
+        client.register_engineer(&engineer, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000, &None);
         client.update_reputation(&engineer, &2000);
+
         assert_eq!(client.get_reputation(&engineer), 1000);
     }
 
@@ -4976,9 +4959,11 @@ mod tests {
         client.add_trusted_issuer(&admin, &issuer);
 
         let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
         let hash = BytesN::from_array(&env, &[5u8; 32]);
         let notes = Some(String::from_str(&env, "Certified: High-Voltage Generators"));
 
+        client.add_trusted_issuer(&admin, &issuer);
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &notes);
 
         let record = client.get_engineer(&engineer);

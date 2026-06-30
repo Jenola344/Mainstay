@@ -1814,7 +1814,7 @@ impl Lifecycle {
         for record in records.iter() {
             score = score
                 .checked_add(weighted_increment)
-                .map(|s| s.min(100))
+                .map(|s: u32| s.min(100))
                 .unwrap_or_else(|| panic_with_error!(&env, ContractError::ScoreOverflow));
             new_records.push_back(MaintenanceRecord {
                 asset_id,
@@ -4175,6 +4175,40 @@ mod tests {
     }
 
     #[test]
+    fn test_collateral_score_respects_theoretical_max_for_config_variants() {
+        let variants = [(1u32, 3u32), (3u32, 5u32), (5u32, 7u32), (10u32, 12u32)];
+
+        for (max_history, score_increment) in variants {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let (client, asset_registry_client, engineer_registry_client, admin) =
+                setup(&env, max_history);
+            let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+            let engineer = register_engineer(&env, &engineer_registry_client);
+            client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+            client.update_score_increment(&admin, &score_increment);
+
+            for _ in 0..max_history {
+                client.submit_maintenance(
+                    &asset_id,
+                    &symbol_short!("OIL_CHG"),
+                    &String::from_str(&env, "invariant"),
+                    &engineer,
+                );
+            }
+
+            let score = client.get_collateral_score(&asset_id);
+            let theoretical_max = max_history.saturating_mul(score_increment);
+            assert!(
+                score <= theoretical_max,
+                "score {score} exceeded theoretical max {theoretical_max} for max_history={max_history} score_increment={score_increment}"
+            );
+        }
+    }
+
+    #[test]
     fn test_non_admin_cannot_update_score_increment() {
         let env = Env::default();
         env.mock_all_auths();
@@ -6197,7 +6231,7 @@ mod tests {
             .iter()
             .filter(|(_, topics, _)| {
                 let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
-                t0.map(|s| s == EVENT_MAINT).unwrap_or(false)
+                t0.map(|s: Symbol| s == EVENT_MAINT).unwrap_or(false)
             })
             .count();
         // One MAINT event per record submitted
@@ -8878,7 +8912,7 @@ mod tests {
             topics
                 .get(0)
                 .and_then(|v| soroban_sdk::TryIntoVal::<_, Symbol>::try_into_val(&v, &env).ok())
-                .map(|s| s == symbol_short!("PROP_ADM"))
+                .map(|s: Symbol| s == symbol_short!("PROP_ADM"))
                 .unwrap_or(false)
         }));
     }
@@ -9983,7 +10017,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_health_snapshots_accumulates() {
+    fn test_get_health_snapshots_accumulates_multiple_snapshots() {
         let env = Env::default();
         env.mock_all_auths();
 
