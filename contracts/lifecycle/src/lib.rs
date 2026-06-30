@@ -8,6 +8,7 @@ use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push};
 use crate::types::{
     BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, ScoreEntry, TimelockProposal,
+    TransferRecord,
 };
 use shared::validation::require_non_empty_vec;
 use soroban_sdk::{
@@ -91,6 +92,10 @@ fn frozen_score_key(asset_id: u64) -> (Symbol, u64) {
 
 fn health_snapshot_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HLTH_SNP"), asset_id)
+}
+
+fn transfer_hist_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("XFER_HIST"), asset_id)
 }
 fn revoke_eng_timelock_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("RVK_TL"), asset_id, engineer.clone())
@@ -1307,10 +1312,54 @@ impl Lifecycle {
             .persistent()
             .extend_ttl(&history_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
+        // Append to the dedicated transfer history for provenance verification.
+        let xfer_key = transfer_hist_key(asset_id);
+        let mut xfer_history: Vec<TransferRecord> = env
+            .storage()
+            .persistent()
+            .get(&xfer_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        xfer_history.push_back(TransferRecord {
+            from: previous_owner.clone(),
+            to: new_owner.clone(),
+            timestamp,
+        });
+        env.storage().persistent().set(&xfer_key, &xfer_history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&xfer_key, TTL_THRESHOLD, TTL_TARGET);
+
         env.events().publish(
             (EVENT_XFER, asset_id),
             (previous_owner, new_owner, timestamp, sentinel_index),
         );
+    }
+
+    /// Return the full ownership transfer history for an asset.
+    ///
+    /// Each entry records the previous owner, new owner, and the ledger timestamp
+    /// at which the transfer was recorded. Useful for provenance verification and
+    /// DeFi due diligence.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset to query
+    ///
+    /// # Returns
+    /// Vec of [`TransferRecord`] in chronological order (oldest first).
+    /// Returns an empty vec if no transfers have occurred.
+    pub fn get_transfer_history(env: Env, asset_id: u64) -> Vec<TransferRecord> {
+        let key = transfer_hist_key(asset_id);
+        let history: Vec<TransferRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        }
+        history
     }
 
     /// Submit multiple maintenance records for the same asset in a single transaction.
@@ -7611,6 +7660,112 @@ mod tests {
             data.try_into_val(&env).unwrap();
 
         assert_eq!(emitted_index, expected_index);
+    }
+
+    #[test]
+    fn test_get_transfer_history_empty_before_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, _, _) = setup(&env, 0);
+        let (asset_id, _owner) = register_asset(&env, &asset_registry);
+
+        let history = lifecycle.get_transfer_history(&asset_id);
+        assert_eq!(history.len(), 0, "transfer history must be empty before any transfer");
+    }
+
+    #[test]
+    fn test_get_transfer_history_records_single_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, _, _) = setup(&env, 0);
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let asset_id = asset_registry.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Provenance Gen A"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        asset_registry.transfer_asset(&asset_id, &owner, &new_owner);
+        lifecycle.record_transfer(&asset_id, &owner, &new_owner);
+
+        let history = lifecycle.get_transfer_history(&asset_id);
+        assert_eq!(history.len(), 1);
+
+        let record = history.get(0).unwrap();
+        assert_eq!(record.from, owner);
+        assert_eq!(record.to, new_owner);
+    }
+
+    #[test]
+    fn test_get_transfer_history_accumulates_multiple_transfers() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, _, _) = setup(&env, 0);
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let owner_c = Address::generate(&env);
+        let asset_id = asset_registry.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Provenance Gen B"),
+            &unique_serial(&env),
+            &owner_a,
+        );
+
+        // First transfer: A → B
+        asset_registry.transfer_asset(&asset_id, &owner_a, &owner_b);
+        lifecycle.record_transfer(&asset_id, &owner_a, &owner_b);
+
+        // Second transfer: B → C
+        asset_registry.transfer_asset(&asset_id, &owner_b, &owner_c);
+        lifecycle.record_transfer(&asset_id, &owner_b, &owner_c);
+
+        let history = lifecycle.get_transfer_history(&asset_id);
+        assert_eq!(history.len(), 2);
+
+        let first = history.get(0).unwrap();
+        assert_eq!(first.from, owner_a);
+        assert_eq!(first.to, owner_b);
+
+        let second = history.get(1).unwrap();
+        assert_eq!(second.from, owner_b);
+        assert_eq!(second.to, owner_c);
+    }
+
+    #[test]
+    fn test_get_transfer_history_timestamp_monotone() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, _, _) = setup(&env, 0);
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let owner_c = Address::generate(&env);
+        let asset_id = asset_registry.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Provenance Gen C"),
+            &unique_serial(&env),
+            &owner_a,
+        );
+
+        env.ledger().with_mut(|li| li.timestamp = 1000);
+        asset_registry.transfer_asset(&asset_id, &owner_a, &owner_b);
+        lifecycle.record_transfer(&asset_id, &owner_a, &owner_b);
+
+        env.ledger().with_mut(|li| li.timestamp = 2000);
+        asset_registry.transfer_asset(&asset_id, &owner_b, &owner_c);
+        lifecycle.record_transfer(&asset_id, &owner_b, &owner_c);
+
+        let history = lifecycle.get_transfer_history(&asset_id);
+        assert_eq!(history.len(), 2);
+        assert!(
+            history.get(0).unwrap().timestamp <= history.get(1).unwrap().timestamp,
+            "transfer history must be in chronological order"
+        );
     }
 
     #[test]

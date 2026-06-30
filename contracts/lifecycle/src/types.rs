@@ -2,6 +2,15 @@
 
 use soroban_sdk::{contracttype, Address, String, Symbol, Map};
 
+/// A single ownership-transfer event recorded in the on-chain transfer history.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferRecord {
+    pub from: Address,
+    pub to: Address,
+    pub timestamp: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceRecord {
@@ -75,4 +84,5 @@ pub enum DataKey {
     EngineerAuth(u64, Address),
     Timelock(Symbol),
     HealthSnapshots(u64),
+    TransferHistory(u64),
 }
