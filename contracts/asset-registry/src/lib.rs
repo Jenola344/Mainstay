@@ -892,6 +892,15 @@ impl AssetRegistry {
         env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0)
     }
 
+    /// Get the total number of registered assets.
+    /// Useful for analytics dashboards and DeFi protocol integrations.
+    ///
+    /// # Returns
+    /// The total number of assets that have ever been registered
+    pub fn get_total_asset_count(env: Env) -> u64 {
+        env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0)
+    }
+
     /// Returns all asset IDs of the given type.
     pub fn get_assets_by_type(env: Env, asset_type: Symbol) -> Vec<u64> {
         let key = type_assets_key(&asset_type);
@@ -4632,6 +4641,41 @@ mod tests {
 
         let status = client.asset_status(&asset_id);
         assert_eq!(status, AssetStatus::Active);
+    }
+
+    #[test]
+    fn test_get_total_asset_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        // Returns 0 before any assets are registered
+        assert_eq!(client.get_total_asset_count(), 0);
+
+        let owner = Address::generate(&env);
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator Unit A"),
+            &unique_serial(&env),
+            &owner,
+        );
+        assert_eq!(client.get_total_asset_count(), 1);
+
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator Unit B"),
+            &unique_serial(&env),
+            &owner,
+        );
+        assert_eq!(client.get_total_asset_count(), 2);
+
+        // get_total_asset_count and get_asset_count must agree
+        assert_eq!(client.get_total_asset_count(), client.get_asset_count());
     }
 
     #[test]
