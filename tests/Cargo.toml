@@ -34,3 +34,7 @@ path = "test_emergency_pause.rs"
 [[test]]
 name = "test_admin_transfer"
 path = "test_admin_transfer.rs"
+
+[[test]]
+name = "test_engineer_credential_expiry"
+path = "test_engineer_credential_expiry.rs"
