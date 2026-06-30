@@ -121,3 +121,117 @@ stellar contract storage extend --id LC_ID --network testnet --durability instan
 If a contract remains inactive for long periods (near 30 days), persistent entries must be manually extended using the `stellar contract storage extend` command to prevent data loss.
 
 Refer to [docs/ttl-strategy.md](ttl-strategy.md) for a full mapping of storage keys.
+
+---
+
+## 6. Testnet vs Mainnet Differences
+
+### 6.1 Network Configuration
+
+| Aspect | Testnet | Mainnet |
+|---|---|---|
+| `--network` flag | `testnet` | `mainnet` |
+| RPC URL | `https://soroban-testnet.stellar.org` | `https://soroban-mainnet.stellar.org` (or your own node) |
+| Lumens required | Funded via Friendbot (`stellar keys fund`) | Real XLM; obtain before deployment |
+| Key management | Generated key (`stellar keys generate`) | Hardware wallet or multisig key ceremony |
+| Deployment script | `./scripts/deploy_testnet.sh` | No equivalent script; use the manual steps in this runbook with `--network mainnet` |
+
+### 6.2 Pre-Mainnet Gate: Security Audit
+
+Mainnet deployment is gated by a completed formal security audit (see §0 above). Do **not** skip this step. Before proceeding:
+
+- [ ] Audit firm has signed off on all findings.
+- [ ] Audit report is published to `docs/audit-report.md`.
+- [ ] All high- and critical-severity findings are resolved and verified.
+
+### 6.3 Mainnet Build & Deploy Steps
+
+Replace every `--network testnet` flag with `--network mainnet`. Do not use `./scripts/deploy_testnet.sh` — that script hard-rejects non-testnet networks.
+
+```bash
+# 1. Build (same as testnet)
+./scripts/build.sh
+
+# 2. Deploy Asset Registry
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/asset_registry.wasm \
+  --network mainnet \
+  --source deployer
+# Save as AR_ID
+
+# 3. Deploy Engineer Registry
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/engineer_registry.wasm \
+  --network mainnet \
+  --source deployer
+# Save as ER_ID
+
+# 4. Deploy Lifecycle (must come after AR and ER)
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/lifecycle.wasm \
+  --network mainnet \
+  --source deployer
+# Save as LC_ID
+```
+
+**Deployment order is mandatory**: Lifecycle `initialize` requires both registry contract IDs, so asset-registry and engineer-registry must be deployed and their IDs noted before lifecycle is deployed.
+
+### 6.4 Mainnet Initialization
+
+Initialize all three contracts in the **same transaction block** as deployment to eliminate front-run risk on initialization.
+
+```bash
+# Initialize Asset Registry
+stellar contract invoke --id AR_ID --network mainnet --source deployer -- initialize_admin \
+  --deployer <DEPLOYER_ADDRESS> \
+  --admin <ADMIN_ADDRESS>
+
+# Initialize Engineer Registry
+stellar contract invoke --id ER_ID --network mainnet --source deployer -- initialize_admin \
+  --deployer <DEPLOYER_ADDRESS> \
+  --admin <ADMIN_ADDRESS>
+
+# Initialize Lifecycle (bind to registries)
+stellar contract invoke --id LC_ID --network mainnet --source deployer -- initialize \
+  --deployer <DEPLOYER_ADDRESS> \
+  --asset_registry AR_ID \
+  --engineer_registry ER_ID \
+  --admin <ADMIN_ADDRESS> \
+  --max_history 200
+```
+
+### 6.5 Post-Deploy Verification Checklist
+
+Run these checks immediately after initialization. Do not hand off to operations until every item is confirmed.
+
+**Registry checks:**
+- [ ] `stellar contract invoke --id AR_ID --network mainnet --source any -- get_admin` returns the expected admin address.
+- [ ] `stellar contract invoke --id ER_ID --network mainnet --source any -- get_admin` returns the expected admin address.
+
+**Cross-contract binding check:**
+- [ ] `stellar contract invoke --id LC_ID --network mainnet --source any -- get_collateral_score --asset_id 999` returns a contract error (`AssetNotFound`), not a panic or `NotInitialized` error. A `NotInitialized` error means the binding was not saved correctly.
+
+**Config check:**
+- [ ] `stellar contract invoke --id LC_ID --network mainnet --source any -- get_config` returns `max_history: 200` and the expected admin address.
+
+**TTL extension:**
+- [ ] Extend instance storage for all three contracts immediately after initialization:
+  ```bash
+  for ID in AR_ID ER_ID LC_ID; do
+    stellar contract storage extend --id $ID --network mainnet --durability instance --ledgers-to-extend 518400
+  done
+  ```
+
+**Smoke test (optional but recommended):**
+- [ ] Register one asset type and one test asset via AR_ID.
+- [ ] Register one engineer via ER_ID.
+- [ ] Submit one maintenance record via LC_ID and confirm `get_collateral_score` returns a non-zero value.
+- [ ] Remove/deregister the test data if the contract supports it, or note the test asset IDs for auditing.
+
+### 6.6 Key Management Differences
+
+On testnet, generated keys (`stellar keys generate`) are acceptable. On mainnet:
+
+- Use a hardware wallet (Ledger) or a dedicated signing key stored in a secrets manager (e.g., HashiCorp Vault).
+- The `deployer` identity should be a cold wallet used exclusively for deployment; transfer admin rights to a multisig account before handing off to operations.
+- Store AR_ID, ER_ID, and LC_ID in a configuration management system (e.g., environment-specific `.env.mainnet`) immediately after deployment — these IDs cannot be recovered once lost without re-deployment.

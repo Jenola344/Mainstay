@@ -117,70 +117,73 @@ sequenceDiagram
 ```
 
 ### Maintenance Submission Flow
+
+The full sequence for `submit_maintenance`. The Lifecycle contract validates the
+task type and notes length locally before making any cross-contract calls to
+avoid wasting gas on invalid inputs.
+
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Engineer as Engineer (Caller)
-    participant Lifecycle as Lifecycle Contract
-    participant AssetRegistry as AssetRegistry Contract
-    participant EngineerRegistry as EngineerRegistry Contract
-
-    Engineer->>Lifecycle: submit_maintenance(asset_id, task_type, notes, engineer)
-    activate Lifecycle
-    Lifecycle->>Engineer: require_auth()
-    
-    Note over Lifecycle: Local Validation:<br/>- Ensure not paused<br/>- Validate task_type & weights<br/>- Validate notes length<br/>- Fetch and prune history if needed
-
-    Lifecycle->>AssetRegistry: try_get_asset(asset_id)
-    activate AssetRegistry
-    AssetRegistry-->>Lifecycle: Result (Asset record or Error)
-    deactivate AssetRegistry
-    alt Asset not found
-        Lifecycle-->>Engineer: panic(AssetNotFound)
-    end
-
-    Lifecycle->>EngineerRegistry: get_credential_status(engineer)
-    activate EngineerRegistry
-    EngineerRegistry-->>Lifecycle: CredentialStatus
-    deactivate EngineerRegistry
-
-    alt CredentialStatus is NOT Valid AND NOT GracePeriod
-        Lifecycle->>EngineerRegistry: verify_engineer(engineer)
-        activate EngineerRegistry
-        EngineerRegistry-->>Lifecycle: CredentialStatus
-        deactivate EngineerRegistry
-        alt CredentialStatus is NOT Valid
-            Lifecycle-->>Engineer: panic(UnauthorizedEngineer)
-        end
-    end
-
-    Note over Lifecycle: Local Auth Check:<br/>Verify engineer is explicitly authorized<br/>by asset owner for asset_id
-    alt Engineer not authorized for this asset
-        Lifecycle-->>Engineer: panic(EngineerNotAuthorized)
-    end
-
-    Lifecycle->>EngineerRegistry: get_reputation(engineer)
-    activate EngineerRegistry
-    EngineerRegistry-->>Lifecycle: reputation (u32, 0-1000)
-    deactivate EngineerRegistry
-
-    Note over Lifecycle: Post-Verification Updates:<br/>1. Append record to history<br/>2. Scale score increment by reputation<br/>3. Recalculate & save collateral score<br/>4. Push score snapshot<br/>5. Update last maintenance timestamp
-
-    Lifecycle->>Engineer: Emit "maint" event (asset_id, engineer, task_type, timestamp)
-    deactivate Lifecycle
-```
-
-### DeFi Collateral Query Flow
-```mermaid
-sequenceDiagram
-    participant Borrower
+    actor Engineer
     participant Lifecycle
     participant AssetRegistry
-    Borrower->>Lifecycle: get_collateral_score(asset_id)
+    participant EngineerRegistry
+
+    Engineer->>Lifecycle: submit_maintenance(asset_id, task_type, notes, engineer)
+    Note over Lifecycle: engineer.require_auth()
+    Note over Lifecycle: validate task_type weight and notes length (local, no cross-call)
+
     Lifecycle->>AssetRegistry: get_asset(asset_id)
-    AssetRegistry-->>Lifecycle: return asset record
-    Lifecycle->>Lifecycle: read score and trend history
-    Lifecycle-->>Borrower: return collateral_score
+    AssetRegistry-->>Lifecycle: Asset { owner, asset_type, deprecation_status, … }
+    Note over Lifecycle: panic AssetNotFound if unknown
+
+    Lifecycle->>EngineerRegistry: get_credential_status(engineer)
+    EngineerRegistry-->>Lifecycle: CredentialStatus (Valid | GracePeriod | HardExpired | Revoked)
+    Note over Lifecycle: panic UnauthorizedEngineer if not Valid or GracePeriod
+
+    Note over Lifecycle: require_engineer_authorized(asset_id, engineer)<br/>reads ENG_AUTH key — panic EngineerNotAuthorized if false
+
+    Lifecycle->>EngineerRegistry: get_reputation(engineer)
+    EngineerRegistry-->>Lifecycle: reputation_score (0–1000)
+
+    Note over Lifecycle: weighted_increment = score_increment × (500 + reputation) / 1000<br/>new_score = min(stored_score + weighted_increment, 100)<br/>Append MaintenanceRecord to HIST<br/>Push ScoreEntry to SCHIST<br/>Write SCORE and LUPD<br/>Update ENG_HIST
+
+    Lifecycle-->>Engineer: emit (maint, asset_id, engineer, task_type, timestamp)
+```
+
+### Collateral Score Query Flow (with Lazy Decay)
+
+`get_collateral_score` is read-only from the caller's perspective but applies
+lazy decay internally and writes the result back so subsequent calls stay
+consistent. Two independent scoring models run in parallel; the lower value wins.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Caller
+    participant Lifecycle
+    participant AssetRegistry
+
+    Caller->>Lifecycle: get_collateral_score(asset_id)
+
+    Lifecycle->>AssetRegistry: get_asset(asset_id)
+    AssetRegistry-->>Lifecycle: Asset { deprecation_status, … }
+    Note over Lifecycle: return 0 immediately if asset is Deprecated or Decommissioned
+
+    Note over Lifecycle: if FROZEN key is set → return FRZ_SCR (score captured at decommission)
+
+    Note over Lifecycle: — Model A: recency-weighted history score —<br/>Read HIST (Vec&lt;MaintenanceRecord&gt;)<br/>For each record:<br/>  age_ledgers = current_ledger − record_ledger<br/>  recency_weight = max(0, MAX_AGE_LEDGERS − age_ledgers)<br/>  contribution = score_increment × recency_weight / MAX_AGE_LEDGERS<br/>history_score = min(Σ contributions, 100)
+
+    Note over Lifecycle: — Model B: stored score with lazy config decay —<br/>Read SCORE (stored accumulated value)<br/>Read LUPD (timestamp of last write)<br/>elapsed = current_time − last_update<br/>decay_intervals = elapsed / decay_interval<br/>config_score = max(0, stored − decay_intervals × decay_rate)
+
+    Note over Lifecycle: score = min(history_score, config_score)
+
+    Note over Lifecycle: — Floor —<br/>if HIST is non-empty and score &lt; 1:<br/>  score = 1  (MIN_SCORE_WITH_HISTORY)
+
+    Note over Lifecycle: Persist score → SCORE<br/>Persist current timestamp → LUPD
+
+    Lifecycle-->>Caller: return score (0–100)
 ```
 
 ---
