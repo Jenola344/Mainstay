@@ -131,6 +131,47 @@ pub enum DataKey {
     AssetsByOwner(Address),
 }
 
+/// Filter criteria for [`AssetRegistry::search_assets`].
+///
+/// All fields are optional; omitting a field means "no constraint on that dimension".
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SearchFilter {
+    /// Return only assets whose `asset_type` matches this value exactly.
+    pub asset_type: Option<Symbol>,
+    /// Return only assets whose `metadata` field contains this substring (case-sensitive).
+    pub manufacturer: Option<String>,
+    /// Return only assets registered at least this many months ago (1 month ≈ 30 days).
+    pub min_age_months: Option<u32>,
+    /// Return only assets registered at most this many months ago (1 month ≈ 30 days).
+    pub max_age_months: Option<u32>,
+    /// How to sort the results.  Defaults to no particular order when `None`.
+    pub sort: Option<SortOrder>,
+    /// Required when `sort` is [`SortOrder::ByCollateralScore`].
+    pub lifecycle_contract: Option<Address>,
+}
+
+/// Sorting options for [`AssetRegistry::search_assets`].
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SortOrder {
+    /// Sort by on-chain collateral score (descending, highest first).
+    /// Requires `SearchFilter::lifecycle_contract` to be set.
+    ByCollateralScore = 0,
+    /// Sort by most-recent metadata update timestamp (descending, newest first).
+    ByMaintenanceDate = 1,
+}
+
+/// Result page returned by [`AssetRegistry::search_assets`].
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SearchPage {
+    /// Matched assets (up to 100).
+    pub assets: Vec<Asset>,
+    /// Total number of assets that matched the filter (before the 100-result cap).
+    pub total: u32,
+}
+
 const ASSET_COUNT: Symbol = symbol_short!("A_COUNT");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
@@ -1802,6 +1843,180 @@ impl AssetRegistry {
             args,
         );
     }
+
+    /// Search assets with optional metadata filtering and sorting.
+    ///
+    /// Scans all registered assets and returns those that match every supplied
+    /// constraint.  At most **100** matching assets are returned; `SearchPage::total`
+    /// always reflects the full match count before the cap is applied.
+    ///
+    /// # Arguments
+    /// * `filter.asset_type`       – exact `asset_type` match (optional)
+    /// * `filter.manufacturer`     – substring present in `metadata` (optional)
+    /// * `filter.min_age_months`   – asset registered ≥ N months ago (optional)
+    /// * `filter.max_age_months`   – asset registered ≤ N months ago (optional)
+    /// * `filter.sort`             – sort order (optional)
+    /// * `filter.lifecycle_contract` – required when sort = `ByCollateralScore`
+    pub fn search_assets(env: Env, filter: SearchFilter) -> SearchPage {
+        const MAX_RESULTS: u32 = 100;
+        const SECS_PER_MONTH: u64 = 30 * 86_400;
+
+        let total_assets: u64 = env
+            .storage()
+            .persistent()
+            .get(&ASSET_COUNT)
+            .unwrap_or(0);
+
+        let now = env.ledger().timestamp();
+
+        let mut matched: Vec<Asset> = Vec::new(&env);
+        let mut total_matched: u32 = 0;
+
+        for id in 1..=total_assets {
+            let key = asset_key(id);
+            let asset: Asset = match env.storage().persistent().get(&key) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            // --- filter: asset_type ---
+            if let Some(ref ft) = filter.asset_type {
+                if asset.asset_type != *ft {
+                    continue;
+                }
+            }
+
+            // --- filter: manufacturer (substring of metadata) ---
+            if let Some(ref needle) = filter.manufacturer {
+                if !string_contains(&env, &asset.metadata, needle) {
+                    continue;
+                }
+            }
+
+            // --- filter: age ---
+            let age_secs = now.saturating_sub(asset.registered_at);
+            let age_months = (age_secs / SECS_PER_MONTH) as u32;
+            if let Some(min) = filter.min_age_months {
+                if age_months < min {
+                    continue;
+                }
+            }
+            if let Some(max) = filter.max_age_months {
+                if age_months > max {
+                    continue;
+                }
+            }
+
+            total_matched += 1;
+            if matched.len() < MAX_RESULTS {
+                matched.push_back(asset);
+            }
+        }
+
+        // --- sort ---
+        if let Some(sort) = filter.sort {
+            match sort {
+                SortOrder::ByCollateralScore => {
+                    if let Some(lc) = filter.lifecycle_contract {
+                        // Fetch scores then sort descending.
+                        let mut pairs: Vec<(u32, Asset)> = Vec::new(&env);
+                        for i in 0..matched.len() {
+                            let asset = matched.get(i).unwrap();
+                            let args = soroban_sdk::vec![
+                                &env,
+                                soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(
+                                    &asset.asset_id,
+                                    &env,
+                                )
+                            ];
+                            let score: u32 = env.invoke_contract(
+                                &lc,
+                                &Symbol::new(&env, "get_collateral_score"),
+                                args,
+                            );
+                            pairs.push_back((score, asset));
+                        }
+                        // Insertion sort descending by score (results ≤ 100, cost acceptable).
+                        let n = pairs.len();
+                        for i in 1..n {
+                            let mut j = i;
+                            while j > 0 {
+                                let a = pairs.get(j - 1).unwrap().0;
+                                let b = pairs.get(j).unwrap().0;
+                                if a >= b {
+                                    break;
+                                }
+                                // swap j-1 and j
+                                let tmp_a = pairs.get(j - 1).unwrap();
+                                let tmp_b = pairs.get(j).unwrap();
+                                pairs.set(j - 1, tmp_b);
+                                pairs.set(j, tmp_a);
+                                j -= 1;
+                            }
+                        }
+                        matched = Vec::new(&env);
+                        for i in 0..n {
+                            matched.push_back(pairs.get(i).unwrap().1);
+                        }
+                    }
+                }
+                SortOrder::ByMaintenanceDate => {
+                    // Sort by metadata_updated_at descending (most recently updated first).
+                    let n = matched.len();
+                    for i in 1..n {
+                        let mut j = i;
+                        while j > 0 {
+                            let a = matched.get(j - 1).unwrap().metadata_updated_at;
+                            let b = matched.get(j).unwrap().metadata_updated_at;
+                            if a >= b {
+                                break;
+                            }
+                            let tmp_a = matched.get(j - 1).unwrap();
+                            let tmp_b = matched.get(j).unwrap();
+                            matched.set(j - 1, tmp_b);
+                            matched.set(j, tmp_a);
+                            j -= 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        SearchPage { assets: matched, total: total_matched }
+    }
+}
+
+/// Returns `true` if `haystack` contains `needle` as a substring (byte-level, UTF-8 safe).
+fn string_contains(env: &Env, haystack: &String, needle: &String) -> bool {
+    use soroban_sdk::xdr::ToXdr;
+    // XDR encodes a string as: 4-byte big-endian length + UTF-8 bytes (+ padding).
+    // We skip the first 4 bytes to obtain raw UTF-8.
+    let h_xdr = haystack.to_xdr(env);
+    let n_xdr = needle.to_xdr(env);
+    let h_len = h_xdr.len();
+    let n_len = n_xdr.len();
+    if n_len <= 4 || h_len < n_len {
+        // needle is empty after the 4-byte header → trivially true;
+        // or haystack shorter than needle → false.
+        return n_len <= 4;
+    }
+    // Raw byte lengths (subtract 4-byte XDR prefix; ignore padding since UTF-8 is before padding).
+    // We work on raw Bytes indices.
+    let h_data_len = h_len - 4;
+    let n_data_len = n_len - 4;
+    if h_data_len < n_data_len {
+        return false;
+    }
+    // Naive O(h*n) scan — acceptable: metadata ≤ 256 bytes.
+    'outer: for start in 0..=(h_data_len - n_data_len) {
+        for k in 0..n_data_len {
+            if h_xdr.get(4 + start + k) != n_xdr.get(4 + k) {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -6202,5 +6417,211 @@ mod tests {
             client.get_asset(&asset_id).deprecation_status,
             DeprecationStatus::Active
         );
+    }
+
+    // ── search_assets tests ──────────────────────────────────────────────────
+
+    fn setup_search_env(env: &Env) -> (AssetRegistryClient, Address) {
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+        (client, admin)
+    }
+
+    #[test]
+    fn test_search_no_filter_returns_all() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Acme Turbine"), &owner);
+        reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Acme Genset"), &owner);
+
+        let page = client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: None,
+            min_age_months: None,
+            max_age_months: None,
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 2);
+        assert_eq!(page.assets.len(), 2);
+    }
+
+    #[test]
+    fn test_search_filter_by_asset_type() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Turbine Alpha"), &owner);
+        reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Genset Beta"), &owner);
+
+        let page = client.search_assets(&SearchFilter {
+            asset_type: Some(symbol_short!("TURBINE")),
+            manufacturer: None,
+            min_age_months: None,
+            max_age_months: None,
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 1);
+        assert_eq!(page.assets.get(0).unwrap().asset_type, symbol_short!("TURBINE"));
+    }
+
+    #[test]
+    fn test_search_filter_by_manufacturer_substring() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Siemens Turbine X"), &owner);
+        reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Caterpillar Genset Y"), &owner);
+
+        let page = client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: Some(String::from_str(&env, "Siemens")),
+            min_age_months: None,
+            max_age_months: None,
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 1);
+        assert_eq!(
+            page.assets.get(0).unwrap().metadata,
+            String::from_str(&env, "Siemens Turbine X")
+        );
+    }
+
+    #[test]
+    fn test_search_filter_manufacturer_no_match() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Acme Turbine"), &owner);
+
+        let page = client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: Some(String::from_str(&env, "Siemens")),
+            min_age_months: None,
+            max_age_months: None,
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 0);
+        assert_eq!(page.assets.len(), 0);
+    }
+
+    #[test]
+    fn test_search_filter_max_age_zero_returns_all_new() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Brand New"), &owner);
+
+        // max_age_months=0 means "registered within the current month" — should match
+        let page = client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: None,
+            min_age_months: None,
+            max_age_months: Some(0),
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 1);
+    }
+
+    #[test]
+    fn test_search_filter_min_age_excludes_new_assets() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "New Turbine"), &owner);
+
+        // min_age_months=1 requires the asset to be at least 30 days old — new asset fails
+        let page = client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: None,
+            min_age_months: Some(1),
+            max_age_months: None,
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 0);
+    }
+
+    #[test]
+    fn test_search_sort_by_maintenance_date() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+
+        let id1 = reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Turbine First"), &owner);
+        // advance time so second asset has a later timestamp
+        env.ledger().set_timestamp(env.ledger().timestamp() + 1000);
+        let id2 = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Genset Second"), &owner);
+
+        let page = client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: None,
+            min_age_months: None,
+            max_age_months: None,
+            sort: Some(SortOrder::ByMaintenanceDate),
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 2);
+        // most recently updated first
+        assert_eq!(page.assets.get(0).unwrap().asset_id, id2);
+        assert_eq!(page.assets.get(1).unwrap().asset_id, id1);
+    }
+
+    #[test]
+    fn test_search_combined_type_and_manufacturer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Siemens Turbine"), &owner);
+        reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Siemens Genset"), &owner);
+
+        let page = client.search_assets(&SearchFilter {
+            asset_type: Some(symbol_short!("GENSET")),
+            manufacturer: Some(String::from_str(&env, "Siemens")),
+            min_age_months: None,
+            max_age_months: None,
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 1);
+        assert_eq!(page.assets.get(0).unwrap().asset_type, symbol_short!("GENSET"));
+    }
+
+    #[test]
+    fn test_search_caps_at_100_results() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        for _ in 0..110u32 {
+            reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Turbine Unit"), &owner);
+        }
+        let page = client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: None,
+            min_age_months: None,
+            max_age_months: None,
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 110);
+        assert_eq!(page.assets.len(), 100);
     }
 }
