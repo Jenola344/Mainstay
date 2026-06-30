@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, String, Symbol, Map};
+use soroban_sdk::{contracttype, Address, String, Symbol, Map, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,6 +31,12 @@ pub struct BatchRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub admin: Address,
+    /// All addresses eligible to co-sign admin operations.
+    /// When empty, `admin` alone controls all operations (single-admin mode).
+    pub admins: Vec<Address>,
+    /// Minimum number of signatures from `admins` required to execute critical operations.
+    /// Ignored when `admins` is empty (single-admin mode) or when set to 0 / 1.
+    pub admin_threshold: u32,
     pub max_history: u32,
     pub score_increment: u32,
     pub decay_rate: u32,
