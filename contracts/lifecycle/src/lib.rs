@@ -9002,6 +9002,11 @@ mod tests {
         assert_eq!(emitted_max, 300);
     }
 
+    /// #804: get_collateral_score must apply decay lazily on each read and persist
+    /// the last decay timestamp so a DeFi lender reading months later receives a
+    /// score that reflects elapsed time without maintenance.
+    #[test]
+    fn test_get_collateral_score_decays_on_stale_read() {
     #[test]
     fn test_reputation_zero_halves_score_increment() {
         // reputation=0 → multiplier 0.5× → 5 * 500/1000 = 2 per submission
@@ -9100,6 +9105,29 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
+        // Submit maintenance to build up a non-zero score.
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "initial service"),
+            &engineer,
+        );
+        let score_after_submit = client.get_collateral_score(&asset_id);
+        assert!(score_after_submit > 0, "score must be >0 after maintenance");
+
+        // Advance time well beyond MAX_AGE_LEDGERS * 5 seconds (≈30 days).
+        // After this, all recency-weighted history contributions drop to zero.
+        let far_future = env.ledger().timestamp() + MAX_AGE_LEDGERS * 5 + 1;
+        env.ledger().set_timestamp(far_future);
+
+        // Reading the score without any new maintenance must return a lower (decayed) value.
+        let stale_score = client.get_collateral_score(&asset_id);
+        assert!(
+            stale_score < score_after_submit,
+            "stale score ({}) must be lower than fresh score ({}) after elapsed time",
+            stale_score,
+            score_after_submit,
+        );
         engineer_registry_client.update_reputation(&engineer, &1000);
 
         client.submit_maintenance(

@@ -3946,12 +3946,36 @@ mod tests {
         assert!(!client.is_engineer_active(&engineer));
     }
 
+    /// #802: removing a trusted issuer must revoke all credentials issued by that issuer.
+    /// verify_engineer for those engineers must return CredentialStatus::Revoked.
+    #[test]
+    fn test_verify_engineer_revoked_after_issuer_removal() {
     #[test]
     fn test_get_reputation_default_is_zero() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin) = setup(&env);
 
+        let issuer = Address::generate(&env);
+        let engineer1 = Address::generate(&env);
+        let engineer2 = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[2u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer1, &hash, &issuer, &31_536_000);
+        client.register_engineer(&engineer2, &BytesN::from_array(&env, &[3u8; 32]), &issuer, &31_536_000);
+
+        // Both engineers are valid before issuer removal.
+        assert_eq!(client.verify_engineer(&engineer1), CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&engineer2), CredentialStatus::Valid);
+
+        // Remove the issuer — all credentials issued by it must be batch-revoked.
+        client.remove_trusted_issuer(&admin, &issuer);
+
+        // Both engineers must now be revoked.
+        assert_eq!(client.verify_engineer(&engineer1), CredentialStatus::Revoked);
+        assert_eq!(client.verify_engineer(&engineer2), CredentialStatus::Revoked);
+    }
         let engineer = Address::generate(&env);
         let issuer = Address::generate(&env);
         let hash = BytesN::from_array(&env, &[1u8; 32]);

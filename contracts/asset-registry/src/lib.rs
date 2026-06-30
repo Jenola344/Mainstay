@@ -499,6 +499,32 @@ fn ensure_not_paused(env: &Env) {
     }
 }
 
+/// Validate that every character in a Symbol is alphanumeric or underscore
+/// (`[A-Za-z0-9_]`). Panics with [`ContractError::InvalidAssetType`] otherwise.
+///
+/// Soroban Symbol XDR layout: 4-byte type tag + 4-byte big-endian length + raw ASCII chars.
+/// We skip the 8-byte header and inspect the remaining bytes directly.
+fn validate_asset_type_symbol(env: &Env, asset_type: &Symbol) {
+    let xdr_bytes = asset_type.clone().to_xdr(env);
+    // XDR header is 8 bytes (4-byte discriminant + 4-byte length).
+    let header_len: u32 = 8;
+    let total = xdr_bytes.len();
+    if total <= header_len {
+        // Empty symbol — treat as invalid.
+        panic_with_error!(env, ContractError::InvalidAssetType);
+    }
+    for i in header_len..total {
+        let b = xdr_bytes.get(i).unwrap_or(0);
+        let valid = (b >= b'A' && b <= b'Z')
+            || (b >= b'a' && b <= b'z')
+            || (b >= b'0' && b <= b'9')
+            || b == b'_';
+        if !valid {
+            panic_with_error!(env, ContractError::InvalidAssetType);
+        }
+    }
+}
+
 #[contract]
 pub struct AssetRegistry;
 
@@ -594,6 +620,9 @@ impl AssetRegistry {
 
         require_string_length(&metadata, "metadata", 256);
         require_string_length(&serial_number, "serial_number", 64);
+
+        // Validate asset_type contains only alphanumeric + underscore characters.
+        validate_asset_type_symbol(&env, &asset_type);
 
         // Validate asset type against allowlist
         if !Self::is_valid_asset_type(env.clone(), asset_type.clone()) {
@@ -6527,6 +6556,24 @@ mod tests {
         client.asset_status(&999);
     }
 
+    // --- Issue #800: Validate asset_type symbol characters in register_asset ---
+
+    /// #800: validate_asset_type_symbol must accept symbols containing only
+    /// alphanumeric characters and underscores, and reject any other input.
+    #[test]
+    fn test_validate_asset_type_symbol_accepts_valid_symbols() {
+        let env = Env::default();
+        // These should not panic — all chars are in [A-Za-z0-9_].
+        validate_asset_type_symbol(&env, &symbol_short!("GENSET"));
+        validate_asset_type_symbol(&env, &symbol_short!("TYPE_1"));
+        validate_asset_type_symbol(&env, &Symbol::new(&env, "TURBINE_A"));
+    }
+
+    /// #800: register_asset must panic with InvalidAssetType when the asset_type
+    /// symbol contains only valid characters but is not in the allowlist.
+    /// This confirms that validate_asset_type_symbol itself does not reject valid-char symbols.
+    #[test]
+    fn test_register_asset_valid_symbol_not_in_allowlist_rejected_with_invalid_type() {
     // --- Deprecation tests ---
 
     #[test]
@@ -6578,6 +6625,23 @@ mod tests {
 
         let admin = Address::generate(&env);
         client.initialize_admin(&admin, &admin);
+        // Do NOT add the type to the allowlist — valid chars but unknown type.
+
+        let owner = Address::generate(&env);
+        let result = client.try_register_asset(
+            &symbol_short!("UNKNOWN"),
+            &String::from_str(&env, "metadata"),
+            &unique_serial(&env),
+            &owner,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidAssetType as u32
+            ))),
+            "valid-char but unallowlisted symbol must fail with InvalidAssetType",
+        );
+    }
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
