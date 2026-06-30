@@ -2744,6 +2744,35 @@ mod tests {
         assert!(dedup_ttl > 0, "Deduplication key TTL should be extended");
     }
 
+    /// Issue #838: every write must extend the relevant persistent entry's TTL
+    /// to at least `TTL_THRESHOLD`. Verify the asset entry after `register_asset`.
+    #[test]
+    fn test_register_asset_ttl_at_least_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "Caterpillar 3516 Generator");
+        let id =
+            client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+
+        let asset_ttl = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&asset_key(id))
+        });
+        assert!(
+            asset_ttl >= TTL_THRESHOLD,
+            "asset entry TTL ({}) must be >= TTL_THRESHOLD ({}) after register_asset",
+            asset_ttl,
+            TTL_THRESHOLD
+        );
+    }
+
     #[test]
     fn test_register_asset_dedup_key_ttl_is_set() {
         let env = Env::default();

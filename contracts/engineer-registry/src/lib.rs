@@ -1840,6 +1840,33 @@ mod tests {
         assert!(ttl > 0, "Engineer TTL should be extended");
     }
 
+    /// Issue #838: every write must extend the relevant persistent entry's TTL
+    /// to at least `TTL_THRESHOLD`. Verify the engineer entry after `register_engineer`.
+    #[test]
+    fn test_register_engineer_ttl_at_least_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let contract_id = client.address.clone();
+        let ttl = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&engineer_key(&engineer))
+        });
+        assert!(
+            ttl >= TTL_THRESHOLD,
+            "engineer entry TTL ({}) must be >= TTL_THRESHOLD ({}) after register_engineer",
+            ttl,
+            TTL_THRESHOLD
+        );
+    }
+
     #[test]
     fn test_issuer_engineers_ttl_extended_on_registration() {
         let env = Env::default();

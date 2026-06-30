@@ -3342,6 +3342,37 @@ mod tests {
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 10);
     }
 
+    /// Issue #838: every write must extend the relevant persistent entry's TTL
+    /// to at least `TTL_THRESHOLD`. Verify the history entry after `submit_maintenance`.
+    #[test]
+    fn test_submit_maintenance_history_ttl_at_least_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Routine oil change"),
+            &engineer,
+        );
+
+        let lifecycle_id = client.address.clone();
+        let history_ttl = env.as_contract(&lifecycle_id, || {
+            env.storage().persistent().get_ttl(&history_key(asset_id))
+        });
+        assert!(
+            history_ttl >= TTL_THRESHOLD,
+            "history entry TTL ({}) must be >= TTL_THRESHOLD ({}) after submit_maintenance",
+            history_ttl,
+            TTL_THRESHOLD
+        );
+    }
+
     #[test]
     fn test_get_collateral_valuation_returns_current_value_and_timestamp() {
         let env = Env::default();
