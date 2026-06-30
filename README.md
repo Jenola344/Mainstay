@@ -178,6 +178,7 @@ Comprehensive test suite covering:
 ✅ Collateral score calculation  
 ✅ Error handling and edge cases  
 ✅ TTL extension verification  
+✅ Paused-contract write rejection (all three contracts)  
 
 Run tests:
 
@@ -187,18 +188,23 @@ cargo test
 
 ## ⚠️ Known Limitations
 
-Mainstay v1 is a strong foundation, but there are several current limitations contributors should be aware of:
+Mainstay v1 is a strong foundation, but there are several intentional constraints and current limitations that contributors and integrators should be aware of before filing issues or building integrations.
 
-- **No native asset transfer support**: Asset ownership metadata is stored in the asset registry, but the lifecycle contract does not yet provide a complete on-chain transfer reconciliation flow. See issue [#600](https://github.com/TwinTrustMainstay/Mainstay/issues/600).
-- **Partial maintenance history handling**: If history is pruned or partially removed, the system currently lacks a robust partial-history recovery path. See issue [#601](https://github.com/TwinTrustMainstay/Mainstay/issues/601).
-- **Hardcoded score weights**: Task type weights are currently defined in contract logic rather than a fully configurable on-chain profile. See issue [#602](https://github.com/TwinTrustMainstay/Mainstay/issues/602).
-- **Unbounded history growth when max_history is high**: A large `max_history` can still lead to expensive history storage and query operations. See issue [#603](https://github.com/TwinTrustMainstay/Mainstay/issues/603).
+- **No lifecycle transfer reconciliation**: When an asset is transferred between owners via `asset_registry::transfer_asset`, the lifecycle contract records a sentinel `XFER` entry but does not perform a full on-chain reconciliation of the maintenance history against the new ownership. DeFi lenders must treat records before the sentinel as belonging to the previous owner's tenure. Full reconciliation is a planned v1.1 feature. See issue [#843](https://github.com/TwinTrustMainstay/Mainstay/issues/843).
+
+- **No partial history recovery path**: If maintenance history is pruned (via `max_history` cap or `prune_asset_history`) or partially lost due to TTL expiry, there is currently no mechanism to reconstruct or recover the missing entries. Health snapshots (`take_health_snapshot`) mitigate data loss for scoring purposes, but the raw record detail is unrecoverable once pruned. See issue [#849](https://github.com/TwinTrustMainstay/Mainstay/issues/849).
+
+- **Hardcoded default task-type score weights**: Task type weights (e.g. `OIL_CHG` = 2, `ENGINE` = 10) have sensible defaults but the per-deployment configuration is limited to the `set_task_weight` admin call. There is no on-chain governance mechanism for weight proposals or community voting. Integrators relying on predictable scoring must pin their expected weights and monitor admin events.
+
+- **Unbounded history growth when `max_history` is high**: A large `max_history` value means per-asset history vectors can grow to hundreds of entries, making every `submit_maintenance` call increasingly expensive in compute and storage fees. Operators running production deployments should set a conservative `max_history` (≤ 200) and use `prune_asset_history` proactively.
+
+- **Engineer authorization is not transferred automatically**: When an asset changes ownership, the previous owner's engineer authorizations remain in storage and must be explicitly cleared by the new owner via `clear_engineer_authorizations`. Failure to do so allows engineers authorised by the previous owner to continue submitting maintenance records under the new owner's asset.
 
 ### Planned resolution timeline
 
-- **v1.1**: Add asset transfer reconciliation and improved history pruning
-- **v1.2**: Make task weights configurable and support partial history reconstruction
-- **v2.0**: Upgrade asset ownership and history indexing for large portfolios
+- **v1.1**: Full asset transfer reconciliation in lifecycle; automatic engineer-auth invalidation on ownership change
+- **v1.2**: Partial history reconstruction via health-snapshot anchoring; configurable weight governance
+- **v2.0**: Scalable history indexing for large portfolios; on-chain weight proposals
 
 ## ⏱️ TTL (Time-To-Live) Strategy
 

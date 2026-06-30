@@ -83,4 +83,9 @@ fn test_full_lifecycle_e2e() {
     assert_eq!(score, 50);
     assert_eq!(lifecycle.get_score_history(&asset_id).len(), 5);
     assert!(lifecycle.is_collateral_eligible(&asset_id));
+
+    let last_record = lifecycle.get_last_maintenance(&asset_id).unwrap();
+    assert_eq!(last_record.asset_id, asset_id);
+    assert_eq!(last_record.task_type, symbol_short!("ENGINE"));
+    assert_eq!(last_record.engineer, engineer);
 }
