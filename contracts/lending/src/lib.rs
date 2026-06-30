@@ -217,10 +217,8 @@ impl LendingContract {
             .extend_ttl(&TOKEN_KEY, TTL_THRESHOLD, TTL_TARGET);
 
         // #640: Emit initialization event.
-        env.events().publish(
-            (symbol_short!("INIT"),),
-            (admin.clone(), token.clone()),
-        );
+        env.events()
+            .publish((symbol_short!("INIT"),), (admin.clone(), token.clone()));
     }
 
     /// Request a new loan for the borrower.
@@ -280,7 +278,7 @@ impl LendingContract {
     /// The contract balance is then asserted to be ≥ total yield. This prevents
     /// the loop from panicking mid-execution when the contract is underfunded
     /// (#627).
-    /// 
+    ///
     /// The caller must match the loan's borrower address (#645).
     pub fn repay(env: Env, borrower: Address) {
         require_not_paused(&env);
@@ -317,7 +315,8 @@ impl LendingContract {
         let mut total_yield: i128 = 0;
         for v in vouches.iter() {
             let yield_amount = (v.stake * YIELD_NUMERATOR / YIELD_DENOMINATOR) as i128;
-            total_yield = total_yield.checked_add(yield_amount)
+            total_yield = total_yield
+                .checked_add(yield_amount)
                 .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeSummationOverflow));
         }
 
@@ -517,11 +516,7 @@ impl LendingContract {
             }
         }
 
-        let current_slash: u64 = env
-            .storage()
-            .persistent()
-            .get(&SLASH_BAL)
-            .unwrap_or(0u64);
+        let current_slash: u64 = env.storage().persistent().get(&SLASH_BAL).unwrap_or(0u64);
         let updated_slash = current_slash + slash_accum;
         env.storage().persistent().set(&SLASH_BAL, &updated_slash);
         env.storage()
@@ -540,11 +535,7 @@ impl LendingContract {
     pub fn slash_treasury(env: Env, admin: Address) {
         require_admin(&env, &admin);
 
-        let slash_balance: u64 = env
-            .storage()
-            .persistent()
-            .get(&SLASH_BAL)
-            .unwrap_or(0u64);
+        let slash_balance: u64 = env.storage().persistent().get(&SLASH_BAL).unwrap_or(0u64);
 
         if slash_balance > 0 {
             let token_addr = get_token(&env);
@@ -603,11 +594,7 @@ impl LendingContract {
 
             let token_addr = get_token(&env);
             let tok = token::Client::new(&env, &token_addr);
-            tok.transfer(
-                &env.current_contract_address(),
-                &voucher,
-                &(stake as i128),
-            );
+            tok.transfer(&env.current_contract_address(), &voucher, &(stake as i128));
         }
     }
 
@@ -626,10 +613,7 @@ impl LendingContract {
 
     /// Returns the accumulated slash balance available for treasury withdrawal.
     pub fn get_slash_balance(env: Env) -> u64 {
-        env.storage()
-            .persistent()
-            .get(&SLASH_BAL)
-            .unwrap_or(0u64)
+        env.storage().persistent().get(&SLASH_BAL).unwrap_or(0u64)
     }
 
     /// Returns whether the contract has been initialized.
@@ -835,7 +819,6 @@ mod tests {
         assert!(SLASH_BPS <= 10_000);
     }
 
-
     fn setup_contract(env: &Env) -> (Address, Address, Address) {
         let admin = Address::generate(env);
         let token = Address::generate(env);
@@ -991,7 +974,10 @@ mod tests {
             })
             .collect();
 
-        assert!(!loan_req_events.is_empty(), "request_loan should emit event");
+        assert!(
+            !loan_req_events.is_empty(),
+            "request_loan should emit event"
+        );
     }
 
     #[test]
