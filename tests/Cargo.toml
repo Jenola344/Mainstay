@@ -38,3 +38,7 @@ path = "test_admin_transfer.rs"
 [[test]]
 name = "test_collateral_score_cap"
 path = "test_collateral_score_cap.rs"
+
+[[test]]
+name = "test_decay_clamps_at_zero"
+path = "test_decay_clamps_at_zero.rs"
