@@ -1,10 +1,7 @@
 #![cfg(test)]
 
 use lending::{LendingContract, LendingContractClient};
-use soroban_sdk::{
-    testutils::Address as _,
-    token, Address, Env,
-};
+use soroban_sdk::{testutils::Address as _, token, Address, Env};
 
 fn setup_contract(env: &Env) -> (LendingContractClient, Address, Address) {
     let contract_id = env.register(LendingContract, ());
