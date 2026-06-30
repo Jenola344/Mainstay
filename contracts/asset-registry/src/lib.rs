@@ -1170,6 +1170,8 @@ impl AssetRegistry {
     /// - [`ContractError::AdminAlreadyInitialized`] if admin has already been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if deployer is not the transaction invoker
     pub fn initialize_admin(env: Env, deployer: Address, admin: Address) {
+        // Soroban SDK removed `env.invoker()`; rely on `require_auth` to enforce
+        // the deployer's signature instead, which is the standard pattern.
         deployer.require_auth();
         if env.storage().instance().has(&ADMIN_KEY) {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
@@ -1583,6 +1585,7 @@ impl AssetRegistry {
         extend_persistent_ttl(&env, &reason_key);
 
         env.events().publish(
+            (symbol_short!("DEPRCATED"), asset_id),
             (symbol_short!("DEPR"), asset_id),
             (owner, reason, env.ledger().timestamp()),
         );

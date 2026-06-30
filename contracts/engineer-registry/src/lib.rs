@@ -349,7 +349,7 @@ impl EngineerRegistry {
     /// # Returns
     /// A CredentialStatus enum:
     /// - `CredentialStatus::Valid` if the engineer has active, non-expired credentials
-    /// - `CredentialStatus::Expired` if the engineer exists but credentials are expired
+    /// - `CredentialStatus::HardExpired` if the engineer exists but credentials are expired
     /// - `CredentialStatus::Revoked` if the engineer exists but credentials are revoked
     /// - `CredentialStatus::NotFound` if the engineer was never registered
     pub fn verify_engineer(env: Env, engineer: Address) -> CredentialStatus {
@@ -639,6 +639,8 @@ impl EngineerRegistry {
     /// - [`ContractError::AdminAlreadyInitialized`] if admin has already been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if deployer is not the transaction invoker
     pub fn initialize_admin(env: Env, deployer: Address, admin: Address) {
+        // Soroban SDK removed `env.invoker()`; `require_auth` enforces the
+        // deployer's signature instead, matching the standard pattern.
         deployer.require_auth();
         if env.storage().instance().has(&admin_key()) {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
@@ -4358,4 +4360,5 @@ mod tests {
         client.revoke_issuer(&issuer);
         assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Revoked);
     }
+}
 }
