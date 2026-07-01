@@ -1,5 +1,6 @@
 #![no_std]
 use shared::validation::{require_non_empty_vec, require_string_length};
+use shared::{TIMELOCK_DELAY_SECS, DEFAULT_TTL_LEDGERS};
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, panic_with_error, symbol_short,
@@ -115,7 +116,6 @@ pub enum DataKey {
 
 const ASSET_COUNT: Symbol = symbol_short!("A_COUNT");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
-const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const ASSET_TYPE_PREFIX: Symbol = symbol_short!("AST_TYPE");
@@ -127,8 +127,8 @@ const MAX_BATCH_SIZE: u32 = 50;
 
 /// Soroban persistent-storage TTL constants.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
-const TTL_THRESHOLD: u32 = 518_400;
-const TTL_TARGET: u32 = 518_400;
+const TTL_THRESHOLD: u32 = DEFAULT_TTL_LEDGERS;
+const TTL_TARGET: u32 = DEFAULT_TTL_LEDGERS;
 pub const DEREG_TOPIC: Symbol = symbol_short!("DEREG");
 pub const ADD_TYPE_TOPIC: Symbol = symbol_short!("ADD_TYPE");
 pub const RM_TYPE_TOPIC: Symbol = symbol_short!("RM_TYPE");
@@ -222,7 +222,7 @@ fn type_count_inc(env: &Env, asset_type: &Symbol) {
     let key = type_count_key(asset_type);
     let count: u64 = env.storage().persistent().get(&key).unwrap_or(0);
     env.storage().persistent().set(&key, &(count + 1));
-    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+    env.storage().persistent().extend_ttl(&key, DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
 }
 
 fn type_count_dec(env: &Env, asset_type: &Symbol) {
@@ -230,7 +230,7 @@ fn type_count_dec(env: &Env, asset_type: &Symbol) {
     let count: u64 = env.storage().persistent().get(&key).unwrap_or(0);
     if count > 0 {
         env.storage().persistent().set(&key, &(count - 1));
-        env.storage().persistent().extend_ttl(&key, 518400, 518400);
+        env.storage().persistent().extend_ttl(&key, DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
     }
 }
 
@@ -248,7 +248,7 @@ fn type_assets_add(env: &Env, asset_type: &Symbol, asset_id: u64) {
         .unwrap_or_else(|| Vec::new(env));
     ids.push_back(asset_id);
     env.storage().persistent().set(&key, &ids);
-    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+    env.storage().persistent().extend_ttl(&key, DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
 }
 
 fn type_assets_remove(env: &Env, asset_type: &Symbol, asset_id: u64) {
@@ -265,7 +265,7 @@ fn type_assets_remove(env: &Env, asset_type: &Symbol, asset_id: u64) {
         }
     }
     env.storage().persistent().set(&key, &updated);
-    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+    env.storage().persistent().extend_ttl(&key, DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
 }
 
 /// Append an asset ID to the owner's index.
@@ -312,12 +312,10 @@ fn owner_index_remove(env: &Env, owner: &Address, asset_id: u64) {
         env.storage().persistent().remove(&key);
     } else {
         env.storage().persistent().set(&key, &updated);
-        env.storage().persistent().extend_ttl(&key, 518400, 518400);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
     }
-    env.storage().persistent().set(&key, &updated);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 /// Category index key: category bytes → Vec<u64> of asset IDs.
@@ -901,7 +899,7 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            env.storage().persistent().extend_ttl(&key, 518400, 518400);
+            env.storage().persistent().extend_ttl(&key, DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
         }
         ids
     }
@@ -962,7 +960,7 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            env.storage().persistent().extend_ttl(&key, 518400, 518400);
+            env.storage().persistent().extend_ttl(&key, DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
         }
 
         let total = all.len();
@@ -1106,7 +1104,7 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::PendingAdminAlreadyExists);
         }
         env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
         env.events().publish(
             (symbol_short!("PROP_ADM"),),
             (admin.clone(), new_admin.clone()),
@@ -1138,7 +1136,7 @@ impl AssetRegistry {
         }
         env.storage().instance().set(&ADMIN_KEY, &pending_admin);
         env.storage().instance().remove(&PENDING_ADMIN_KEY);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("ADMIN_SET")),
             (pending_admin.clone(), env.ledger().timestamp()),
@@ -1514,7 +1512,7 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
 
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
 
         let tl_key = global_timelock_key(symbol_short!("UPGRADE"));
         env.storage().persistent().set(
@@ -1574,7 +1572,7 @@ impl AssetRegistry {
             .persistent()
             .remove(&symbol_short!("PEND_UPG"));
 
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
 
         env.events().publish(
             (symbol_short!("UPGRADE"), admin.clone()),
@@ -4414,13 +4412,12 @@ mod tests {
             persistent_count, 1,
             "type count must be in persistent storage"
         );
-
-        // Advance ledger sequence well past the instance TTL window.
+        // Advance ledger sequence well past the instance TTL window (~30 days).
         // In the old code this would cause instance storage to return 0,
         // allowing remove_asset_type to succeed incorrectly.
         env.ledger().with_mut(|li| {
-            li.sequence_number += 518400 + 1;
-            li.timestamp += (518400 + 1) * 5;
+            li.sequence_number += DEFAULT_TTL_LEDGERS as u64 + 1;
+            li.timestamp += (DEFAULT_TTL_LEDGERS as u64 + 1) * 5;
         });
 
         // remove_asset_type must still be blocked because the asset still exists.

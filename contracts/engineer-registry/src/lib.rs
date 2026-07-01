@@ -1,5 +1,6 @@
 #![no_std]
 use shared::validation::require_within_bounds;
+use shared::{TIMELOCK_DELAY_SECS, MIN_VALIDITY_PERIOD, GRACE_PERIOD_SECS, DEFAULT_TTL_LEDGERS};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     BytesN, Env, String, Symbol, Vec,
@@ -79,20 +80,16 @@ const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const ENGINEER_COUNT: Symbol = symbol_short!("ENG_CNT");
 const REG_ENG_TOPIC: Symbol = symbol_short!("REG_ENG");
 const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
-const MIN_VALIDITY_PERIOD: u64 = 86_400;
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
-const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Default grace period allowing engineers to work after credential expiry (7 days).
-const DEFAULT_GRACE_PERIOD_SECS: u64 = 7 * 86_400;
+const DEFAULT_GRACE_PERIOD_SECS: u64 = GRACE_PERIOD_SECS;
 const GRACE_PERIOD_KEY: Symbol = symbol_short!("GRACE_P");
 const MAX_BATCH_REVOKE: u32 = 50;
-/// Grace period allowing engineers to work after credential expiry (7 days).
-const GRACE_PERIOD_SECS: u64 = 7 * 86_400;
 
 /// Soroban persistent-storage TTL constants.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
-const TTL_THRESHOLD: u32 = 518_400;
-const TTL_TARGET: u32 = 518_400;
+const TTL_THRESHOLD: u32 = DEFAULT_TTL_LEDGERS;
+const TTL_TARGET: u32 = DEFAULT_TTL_LEDGERS;
 
 fn is_paused(env: &Env) -> bool {
     env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
@@ -677,7 +674,7 @@ impl EngineerRegistry {
         env.storage()
             .instance()
             .set(&pending_admin_key(), &new_admin);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
         env.events()
             .publish((EVENT_PROP_ADMIN,), (admin.clone(), new_admin.clone()));
         env.events().publish(
@@ -701,7 +698,7 @@ impl EngineerRegistry {
         pending_admin.require_auth();
         env.storage().instance().set(&admin_key(), &pending_admin);
         env.storage().instance().remove(&pending_admin_key());
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("ADMIN_SET")),
             (pending_admin.clone(), env.ledger().timestamp()),
@@ -1071,7 +1068,7 @@ impl EngineerRegistry {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
 
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
 
         let tl_key = upgrade_timelock_key();
         env.storage().persistent().set(
@@ -1131,7 +1128,7 @@ impl EngineerRegistry {
             .persistent()
             .remove(&symbol_short!("PEND_UPG"));
 
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
 
         env.events().publish(
             (symbol_short!("UPGRADE"), admin.clone()),
