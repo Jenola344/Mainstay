@@ -38,10 +38,16 @@ path = "test_admin_transfer.rs"
 [[test]]
 name = "test_admin_timelock"
 path = "test_admin_timelock.rs"
+
+[[test]]
 name = "test_multi_asset_collateral"
 path = "test_multi_asset_collateral.rs"
+
+[[test]]
 name = "test_paused_contract"
 path = "test_paused_contract.rs"
+
+[[test]]
 name = "test_collateral_score_cap"
 path = "test_collateral_score_cap.rs"
 
