@@ -34,6 +34,8 @@ pub enum ContractError {
     AssetDecommissioned = 22,
     /// Fewer valid signers were provided than the configured admin_threshold requires.
     InsufficientSigners = 22,
+    /// Batch submission exceeds the maximum allowed batch size (DoS / gas-limit guard).
+    BatchTooLarge = 23,
 }
 
 impl From<SharedContractError> for ContractError {

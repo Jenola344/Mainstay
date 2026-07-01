@@ -30,6 +30,18 @@ const DEFAULT_DECAY_RATE: u32 = 5;
 const DEFAULT_DECAY_INTERVAL: u64 = 2592000; // 30 days in seconds
 const DEFAULT_ELIGIBILITY_THRESHOLD: u32 = 50;
 const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
+/// Hard cap on the number of records accepted in a single
+/// `batch_submit_maintenance` call.
+///
+/// This bounds per-transaction work to prevent a single caller from
+/// submitting an unbounded `Vec<BatchRecord>` that could blow past Soroban
+/// ledger gas/instruction limits and cause a denial-of-service. The value
+/// is intentionally conservative: maintenance batches are expected to be
+/// small (single asset, single engineer, single session), and 50 records
+/// comfortably covers realistic workflows while leaving ample headroom
+/// for the cross-contract calls and per-record validation performed
+/// inside the batch path.
+pub const MAX_BATCH_SIZE: u32 = 50;
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Minimum score returned for an asset that has at least one maintenance record.
 /// Prevents decay from making a legitimately-maintained asset indistinguishable
@@ -1721,6 +1733,7 @@ impl Lifecycle {
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
     /// - [`ContractError::UnauthorizedEngineer`] if the engineer is not verified
     /// - [`ContractError::HistoryCapReached`] if adding records would exceed max history
+    /// - [`ContractError::BatchTooLarge`] if `records.len() > MAX_BATCH_SIZE`
     pub fn batch_submit_maintenance(
         env: Env,
         asset_id: u64,
@@ -1738,6 +1751,14 @@ impl Lifecycle {
 
         // Validate records early before cross-contract calls
         require_non_empty_vec(&records, "records");
+
+        // DoS / gas-limit guard: reject unbounded batches before doing any
+        // further work (cross-contract calls, storage reads, etc.). This
+        // returns a structured `BatchTooLarge` contract error rather than
+        // letting the transaction exhaust the ledger's instruction budget.
+        if records.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, ContractError::BatchTooLarge);
+        }
         for record in records.iter() {
             validate_notes_length(&env, &record.notes, config.max_notes_length);
             // Validate task type is known
@@ -6261,6 +6282,75 @@ mod tests {
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::InvalidTaskType as u32,
             ))),
+        );
+    }
+
+    /// Regression test: a `batch_submit_maintenance` call carrying more
+    /// than `MAX_BATCH_SIZE` records must be rejected with the structured
+    /// `BatchTooLarge` contract error, *before* any cross-contract calls
+    /// or storage writes occur. This protects the contract from a DoS
+    /// where an unbounded `Vec<BatchRecord>` could exhaust the ledger's
+    /// gas/instruction budget.
+    #[test]
+    fn test_batch_submit_maintenance_rejects_oversized_batch() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Build a batch with one more record than the allowed maximum.
+        let mut records = Vec::new(&env);
+        for _ in 0..(MAX_BATCH_SIZE + 1) {
+            records.push_back(BatchRecord {
+                task_type: symbol_short!("OIL_CHG"),
+                notes: String::from_str(&env, "Oil change"),
+            });
+        }
+
+        let result = client.try_batch_submit_maintenance(&asset_id, &records, &engineer);
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::BatchTooLarge as u32,
+            ))),
+        );
+
+        // Confirm no partial state was written: no maintenance history,
+        // no score, no engineer history entry for this asset.
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 0);
+        assert_eq!(client.get_collateral_score(&asset_id), 0);
+    }
+
+    /// Boundary test: a batch with exactly `MAX_BATCH_SIZE` records must
+    /// be accepted (the limit is inclusive on the allowed side).
+    #[test]
+    fn test_batch_submit_maintenance_accepts_max_batch_size() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let mut records = Vec::new(&env);
+        for _ in 0..MAX_BATCH_SIZE {
+            records.push_back(BatchRecord {
+                task_type: symbol_short!("OIL_CHG"),
+                notes: String::from_str(&env, "Oil change"),
+            });
+        }
+
+        // Should not panic / should not return an error.
+        client.batch_submit_maintenance(&asset_id, &records, &engineer);
+
+        assert_eq!(
+            client.get_maintenance_history(&asset_id).len(),
+            MAX_BATCH_SIZE
         );
     }
 
