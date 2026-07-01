@@ -1,9 +1,13 @@
 #![no_std]
 
+use shared::error::SharedContractError;
+use shared::extend_persistent_ttl;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
     Address, Env, Symbol, Vec,
 };
+
+pub use shared::error::SharedContractError as SharedError;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -39,6 +43,22 @@ pub enum ContractError {
     TooManyVouchers = 14,
     /// Voucher withdrawal not allowed.
     VouchWithdrawNotAllowed = 15,
+    /// Caller is not the authorized borrower for this loan.
+    UnauthorizedBorrower = 16,
+}
+
+impl From<SharedContractError> for ContractError {
+    fn from(e: SharedContractError) -> Self {
+        match e {
+            SharedContractError::NotInitialized => ContractError::NotInitialized,
+            SharedContractError::AlreadyInitialized => ContractError::AlreadyInitialized,
+            SharedContractError::UnauthorizedAdmin => ContractError::UnauthorizedAdmin,
+            SharedContractError::Paused => ContractError::ContractPaused,
+            SharedContractError::TimelockNotExpired => ContractError::NotInitialized,
+            SharedContractError::ProposalNotFound => ContractError::NotInitialized,
+            SharedContractError::PendingAdminAlreadyExists => ContractError::NotInitialized,
+        }
+    }
 }
 
 #[contracttype]
@@ -58,6 +78,7 @@ pub struct Loan {
     pub amount: u64,
     pub status: LoanStatus,
     pub deadline: u64,
+    pub id: u64,
 }
 
 #[contracttype]
@@ -75,13 +96,20 @@ pub struct Borrower {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Liquidation {
+    pub asset_id: u64,
+    pub lender: Address,
+    pub loan_id: u64,
+    pub initiated_at: u64,
+    pub completed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub yield_bps: u64,
     pub slash_bps: u64,
 }
-
-const TTL_THRESHOLD: u32 = 518_400;
-const TTL_TARGET: u32 = 518_400;
 
 /// Default yield rate numerator: 2% = 200 / 10_000.
 const DEFAULT_YIELD_NUMERATOR: u64 = 200;
@@ -133,6 +161,10 @@ fn vouches_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
 
 fn voucher_history_key(voucher: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("V_HIST"), voucher.clone())
+}
+
+fn liens_key(asset_id: u64) -> DataKey {
+    DataKey::Liens(asset_id)
 }
 
 fn get_admin(env: &Env) -> Address {
@@ -208,19 +240,13 @@ impl LendingContract {
         }
 
         env.storage().persistent().set(&ADMIN_KEY, &admin);
-        env.storage()
-            .persistent()
-            .extend_ttl(&ADMIN_KEY, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &ADMIN_KEY);
         env.storage().persistent().set(&TOKEN_KEY, &token);
-        env.storage()
-            .persistent()
-            .extend_ttl(&TOKEN_KEY, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &TOKEN_KEY);
 
         // #640: Emit initialization event.
-        env.events().publish(
-            (symbol_short!("INIT"),),
-            (admin.clone(), token.clone()),
-        );
+        env.events()
+            .publish((symbol_short!("INIT"),), (admin.clone(), token.clone()));
     }
 
     /// Request a new loan for the borrower.
@@ -248,16 +274,20 @@ impl LendingContract {
         }
 
         let deadline = env.ledger().timestamp() + get_loan_duration(&env);
+        let loan_id_counter: u64 = env.storage().persistent().get(&symbol_short!("L_COUNT")).unwrap_or(0);
+        let new_loan_id = loan_id_counter + 1;
+        env.storage().persistent().set(&symbol_short!("L_COUNT"), &new_loan_id);
+        env.storage().persistent().set(&(symbol_short!("L_MAP"), new_loan_id), &borrower);
+
         let loan = Loan {
             borrower: borrower.clone(),
             amount,
             status: LoanStatus::Active,
             deadline,
+            id: new_loan_id,
         };
         env.storage().persistent().set(&key, &loan);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &key);
 
         // Transfer the loan amount to the borrower
         tok.transfer(
@@ -280,7 +310,7 @@ impl LendingContract {
     /// The contract balance is then asserted to be ≥ total yield. This prevents
     /// the loop from panicking mid-execution when the contract is underfunded
     /// (#627).
-    /// 
+    ///
     /// The caller must match the loan's borrower address (#645).
     pub fn repay(env: Env, borrower: Address) {
         require_not_paused(&env);
@@ -298,7 +328,9 @@ impl LendingContract {
         }
 
         // #645: Verify the caller matches the loan's borrower.
-        assert_eq!(borrower, loan.borrower);
+        if borrower != loan.borrower {
+            panic_with_error!(&env, ContractError::UnauthorizedBorrower);
+        }
 
         let vouches: Vec<Vouch> = env
             .storage()
@@ -317,7 +349,8 @@ impl LendingContract {
         let mut total_yield: i128 = 0;
         for v in vouches.iter() {
             let yield_amount = (v.stake * YIELD_NUMERATOR / YIELD_DENOMINATOR) as i128;
-            total_yield = total_yield.checked_add(yield_amount)
+            total_yield = total_yield
+                .checked_add(yield_amount)
                 .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeSummationOverflow));
         }
 
@@ -331,9 +364,7 @@ impl LendingContract {
 
         loan.status = LoanStatus::Repaid;
         env.storage().persistent().set(&key, &loan);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &key);
 
         // #632: Distribute yield to vouchers from collected repayment.
         for v in vouches.iter() {
@@ -425,9 +456,7 @@ impl LendingContract {
             stake,
         });
         env.storage().persistent().set(&key, &vouches);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &key);
 
         let hist_key = voucher_history_key(&voucher);
         let mut history: Vec<Address> = env
@@ -437,9 +466,7 @@ impl LendingContract {
             .unwrap_or_else(|| Vec::new(&env));
         history.push_back(borrower);
         env.storage().persistent().set(&hist_key, &history);
-        env.storage()
-            .persistent()
-            .extend_ttl(&hist_key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &hist_key);
     }
 
     /// Admin-only: mark a loan as defaulted and slash based on configured rate.
@@ -452,9 +479,6 @@ impl LendingContract {
     /// Enforces max_vouchers_per_loan cap to prevent gas exhaustion (#633).
     pub fn slash(env: Env, admin: Address, borrower: Address) {
         require_admin(&env, &admin);
-
-        // #646: Guard against misconfigured SLASH_BPS exceeding 10_000.
-        assert!(SLASH_BPS <= 10_000);
 
         let key = loan_key(&borrower);
         let mut loan: Loan = env
@@ -469,9 +493,13 @@ impl LendingContract {
 
         loan.status = LoanStatus::Defaulted;
         env.storage().persistent().set(&key, &loan);
+        extend_persistent_ttl(&env, &key);
+
+        let default_time = env.ledger().timestamp();
+        env.storage().persistent().set(&(symbol_short!("DEF_TIME"), borrower.clone()), &default_time);
         env.storage()
             .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+            .extend_ttl(&(symbol_short!("DEF_TIME"), borrower.clone()), TTL_THRESHOLD, TTL_TARGET);
 
         let borrower_key_val = borrower_key(&borrower);
         if let Some(mut borrower_record) = env
@@ -483,9 +511,7 @@ impl LendingContract {
             env.storage()
                 .persistent()
                 .set(&borrower_key_val, &borrower_record);
-            env.storage()
-                .persistent()
-                .extend_ttl(&borrower_key_val, TTL_THRESHOLD, TTL_TARGET);
+            extend_persistent_ttl(&env, &borrower_key_val);
         }
 
         let vouches: Vec<Vouch> = env
@@ -517,16 +543,10 @@ impl LendingContract {
             }
         }
 
-        let current_slash: u64 = env
-            .storage()
-            .persistent()
-            .get(&SLASH_BAL)
-            .unwrap_or(0u64);
+        let current_slash: u64 = env.storage().persistent().get(&SLASH_BAL).unwrap_or(0u64);
         let updated_slash = current_slash + slash_accum;
         env.storage().persistent().set(&SLASH_BAL, &updated_slash);
-        env.storage()
-            .persistent()
-            .extend_ttl(&SLASH_BAL, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &SLASH_BAL);
 
         env.events()
             .publish((LOAN_SLASHED,), (borrower.clone(), slash_accum));
@@ -540,11 +560,7 @@ impl LendingContract {
     pub fn slash_treasury(env: Env, admin: Address) {
         require_admin(&env, &admin);
 
-        let slash_balance: u64 = env
-            .storage()
-            .persistent()
-            .get(&SLASH_BAL)
-            .unwrap_or(0u64);
+        let slash_balance: u64 = env.storage().persistent().get(&SLASH_BAL).unwrap_or(0u64);
 
         if slash_balance > 0 {
             let token_addr = get_token(&env);
@@ -555,9 +571,7 @@ impl LendingContract {
                 &(slash_balance as i128),
             );
             env.storage().persistent().set(&SLASH_BAL, &0u64);
-            env.storage()
-                .persistent()
-                .extend_ttl(&SLASH_BAL, TTL_THRESHOLD, TTL_TARGET);
+            extend_persistent_ttl(&env, &SLASH_BAL);
         }
     }
 
@@ -597,17 +611,11 @@ impl LendingContract {
 
             vouches.remove(idx);
             env.storage().persistent().set(&key, &vouches);
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+            extend_persistent_ttl(&env, &key);
 
             let token_addr = get_token(&env);
             let tok = token::Client::new(&env, &token_addr);
-            tok.transfer(
-                &env.current_contract_address(),
-                &voucher,
-                &(stake as i128),
-            );
+            tok.transfer(&env.current_contract_address(), &voucher, &(stake as i128));
         }
     }
 
@@ -626,10 +634,7 @@ impl LendingContract {
 
     /// Returns the accumulated slash balance available for treasury withdrawal.
     pub fn get_slash_balance(env: Env) -> u64 {
-        env.storage()
-            .persistent()
-            .get(&SLASH_BAL)
-            .unwrap_or(0u64)
+        env.storage().persistent().get(&SLASH_BAL).unwrap_or(0u64)
     }
 
     /// Returns whether the contract has been initialized.
@@ -661,9 +666,7 @@ impl LendingContract {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().persistent().set(&PAUSED_KEY, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &PAUSED_KEY);
         env.events()
             .publish((symbol_short!("PAUSED"),), (admin.clone(),));
     }
@@ -676,9 +679,7 @@ impl LendingContract {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().persistent().set(&PAUSED_KEY, &false);
-        env.storage()
-            .persistent()
-            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &PAUSED_KEY);
         env.events()
             .publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
     }
@@ -686,6 +687,98 @@ impl LendingContract {
     /// Returns true if the contract is currently paused.
     pub fn is_paused(env: Env) -> bool {
         env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
+    }
+
+    /// Record a lien on an asset. Only the contract admin may call this.
+    ///
+    /// Stores a [`LienRecord`] indicating that `lender` has a claim of `amount`
+    /// against the asset identified by `asset_id` under the loan `loan_id`.
+    /// If an identical lien (same asset + lender + loan_id) already exists,
+    /// panics with [`ContractError::LienAlreadyExists`].
+    pub fn record_lien(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        lender: Address,
+        loan_id: u64,
+        amount: u64,
+    ) {
+        require_admin(&env, &admin);
+
+        let key = liens_key(asset_id);
+        let mut liens: Vec<LienRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        for lien in liens.iter() {
+            if lien.lender == lender && lien.loan_id == loan_id {
+                panic_with_error!(&env, ContractError::LienAlreadyExists);
+            }
+        }
+
+        liens.push_back(LienRecord {
+            lender,
+            loan_id,
+            amount,
+        });
+        env.storage().persistent().set(&key, &liens);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Release (remove) a previously recorded lien. Only the contract admin may call this.
+    ///
+    /// Panics with [`ContractError::LienNotFound`] if no matching lien exists
+    /// for the given asset, lender, and loan_id.
+    pub fn release_lien(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        lender: Address,
+        loan_id: u64,
+    ) {
+        require_admin(&env, &admin);
+
+        let key = liens_key(asset_id);
+        let mut liens: Vec<LienRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::LienNotFound));
+
+        let mut found_index: Option<u32> = None;
+        for (i, lien) in liens.iter().enumerate() {
+            if lien.lender == lender && lien.loan_id == loan_id {
+                found_index = Some(i as u32);
+                break;
+            }
+        }
+
+        match found_index {
+            Some(idx) => {
+                liens.remove(idx);
+                if liens.is_empty() {
+                    env.storage().persistent().remove(&key);
+                } else {
+                    env.storage().persistent().set(&key, &liens);
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+                }
+            }
+            None => panic_with_error!(&env, ContractError::LienNotFound),
+        }
+    }
+
+    /// Returns all active lien records for the given asset.
+    pub fn get_liens(env: Env, asset_id: u64) -> Vec<LienRecord> {
+        env.storage()
+            .persistent()
+            .get(&liens_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
 
@@ -708,7 +801,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
         assert!(client.is_initialized());
     }
 
@@ -724,7 +817,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         let retrieved_admin = client.get_admin();
         assert_eq!(retrieved_admin, admin);
@@ -742,7 +835,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         let retrieved_token = client.get_token();
         assert_eq!(retrieved_token, token);
@@ -760,7 +853,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         // Verify initial slash balance is zero
         let initial_balance = client.get_slash_balance();
@@ -785,7 +878,7 @@ mod tests {
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         (env, contract_id, admin, token, deployer)
     }
@@ -835,7 +928,6 @@ mod tests {
         assert!(SLASH_BPS <= 10_000);
     }
 
-
     fn setup_contract(env: &Env) -> (Address, Address, Address) {
         let admin = Address::generate(env);
         let token = Address::generate(env);
@@ -844,7 +936,7 @@ mod tests {
         let client = LendingContractClient::new(env, &contract_id);
         let deployer = Address::generate(env);
 
-        client.initialize(&deployer, &admin, &token);
+        client.initialize(&deployer, &admin, &token, &0);
 
         (contract_id, admin, token)
     }
@@ -967,7 +1059,7 @@ mod tests {
         let contract_id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &contract_id);
 
-        client.initialize(&deployer, &admin, &token_addr);
+        client.initialize(&deployer, &admin, &token_addr, &0);
 
         let amount = 1000u64;
         client.request_loan(&borrower, &amount);
@@ -991,7 +1083,10 @@ mod tests {
             })
             .collect();
 
-        assert!(!loan_req_events.is_empty(), "request_loan should emit event");
+        assert!(
+            !loan_req_events.is_empty(),
+            "request_loan should emit event"
+        );
     }
 
     #[test]
@@ -1008,7 +1103,7 @@ mod tests {
         let contract_id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &contract_id);
 
-        client.initialize(&deployer, &admin, &token_addr);
+        client.initialize(&deployer, &admin, &token_addr, &0);
         client.request_loan(&borrower, &1000u64);
 
         let stake = 100u64;
@@ -1049,7 +1144,7 @@ mod tests {
         let contract_id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &contract_id);
 
-        client.initialize(&deployer, &admin, &token_addr);
+        client.initialize(&deployer, &admin, &token_addr, &0);
         client.request_loan(&borrower, &1000u64);
 
         client.repay(&borrower);
@@ -1089,7 +1184,7 @@ mod tests {
         let contract_id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &contract_id);
 
-        client.initialize(&deployer, &admin, &token_addr);
+        client.initialize(&deployer, &admin, &token_addr, &0);
         client.request_loan(&borrower, &1000u64);
 
         client.slash(&admin, &borrower);
@@ -1155,5 +1250,176 @@ mod tests {
                 ContractError::ContractPaused as u32
             )))
         );
+    }
+
+    // ── issue #876: lien recording ─────────────────────────────────────
+
+    #[test]
+    fn test_record_and_get_lien() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
+        let lender = Address::generate(&env);
+        client.record_lien(&admin, &1, &lender, &42, &1000);
+
+        let liens = client.get_liens(&1);
+        assert_eq!(liens.len(), 1);
+        assert_eq!(liens.get(0).unwrap().lender, lender);
+        assert_eq!(liens.get(0).unwrap().loan_id, 42);
+        assert_eq!(liens.get(0).unwrap().amount, 1000);
+    }
+
+    #[test]
+    fn test_record_multiple_liens_same_asset() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
+        let lender1 = Address::generate(&env);
+        let lender2 = Address::generate(&env);
+
+        client.record_lien(&admin, &1, &lender1, &42, &1000);
+        client.record_lien(&admin, &1, &lender2, &99, &2500);
+
+        let liens = client.get_liens(&1);
+        assert_eq!(liens.len(), 2);
+    }
+
+    #[test]
+    fn test_record_duplicate_lien_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
+        let lender = Address::generate(&env);
+        client.record_lien(&admin, &1, &lender, &42, &1000);
+
+        let result = client.try_record_lien(&admin, &1, &lender, &42, &2000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_release_lien() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
+        let lender = Address::generate(&env);
+        client.record_lien(&admin, &1, &lender, &42, &1000);
+        assert_eq!(client.get_liens(&1).len(), 1);
+
+        client.release_lien(&admin, &1, &lender, &42);
+        assert_eq!(client.get_liens(&1).len(), 0);
+    }
+
+    #[test]
+    fn test_release_nonexistent_lien_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
+        let lender = Address::generate(&env);
+        let result = client.try_release_lien(&admin, &1, &lender, &42);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_record_lien_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
+        let non_admin = Address::generate(&env);
+        let lender = Address::generate(&env);
+
+        // With mock_all_auths any address passes auth — but require_admin
+        // checks the stored admin, so non_admin should still fail.
+        let result = client.try_record_lien(&non_admin, &1, &lender, &42, &1000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_release_lien_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
+        let non_admin = Address::generate(&env);
+        let lender = Address::generate(&env);
+
+        let result = client.try_release_lien(&non_admin, &1, &lender, &42);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_liens_different_assets() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token);
+
+        let lender = Address::generate(&env);
+        client.record_lien(&admin, &1, &lender, &42, &1000);
+        client.record_lien(&admin, &2, &lender, &43, &2000);
+
+        assert_eq!(client.get_liens(&1).len(), 1);
+        assert_eq!(client.get_liens(&2).len(), 1);
+        assert_eq!(client.get_liens(&3).len(), 0);
     }
 }
