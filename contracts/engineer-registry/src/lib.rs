@@ -746,7 +746,7 @@ impl EngineerRegistry {
         env.storage()
             .instance()
             .set(&pending_admin_key(), &new_admin);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
         env.events()
             .publish((EVENT_PROP_ADMIN,), (admin.clone(), new_admin.clone()));
         env.events().publish(
@@ -770,7 +770,7 @@ impl EngineerRegistry {
         pending_admin.require_auth();
         env.storage().instance().set(&admin_key(), &pending_admin);
         env.storage().instance().remove(&pending_admin_key());
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("ADMIN_SET")),
             (pending_admin.clone(), env.ledger().timestamp()),
@@ -1279,7 +1279,7 @@ impl EngineerRegistry {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
 
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
 
         let tl_key = upgrade_timelock_key();
         env.storage().persistent().set(
@@ -1340,7 +1340,7 @@ impl EngineerRegistry {
             .persistent()
             .remove(&symbol_short!("PEND_UPG"));
 
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
 
         env.events().publish(
             (symbol_short!("UPGRADE"), admin.clone()),

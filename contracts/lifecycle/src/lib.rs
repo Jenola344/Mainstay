@@ -12,6 +12,7 @@ use crate::types::{
 };
 use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
+use shared::{TIMELOCK_DELAY_SECS, DEFAULT_DECAY_INTERVAL_SECS, DEFAULT_TTL_LEDGERS};
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, Address, Bytes, BytesN, Env, Map,
     String, Symbol, Vec,
@@ -27,7 +28,7 @@ const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 const DEFAULT_MAX_HISTORY: u32 = 200;
 const DEFAULT_SCORE_INCREMENT: u32 = 5;
 const DEFAULT_DECAY_RATE: u32 = 5;
-const DEFAULT_DECAY_INTERVAL: u64 = 2592000; // 30 days in seconds
+const DEFAULT_DECAY_INTERVAL: u64 = DEFAULT_DECAY_INTERVAL_SECS;
 const DEFAULT_ELIGIBILITY_THRESHOLD: u32 = 50;
 const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
 /// Hard cap on the number of records accepted in a single
@@ -47,11 +48,11 @@ const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Prevents decay from making a legitimately-maintained asset indistinguishable
 /// from one with no history at all.
 const MIN_SCORE_WITH_HISTORY: u32 = 1;
-/// Maximum age in ledgers for maintenance record recency weighting.
+/// Maximum age in ledgers for maintenance record recency weighting (~30 days).
 /// Records older than this contribute zero to the collateral score.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
 /// Older records still contribute nothing, newer records are weighted linearly.
-const MAX_AGE_LEDGERS: u64 = 518_400;
+const MAX_AGE_LEDGERS: u64 = DEFAULT_TTL_LEDGERS as u64;
 
 const EVENT_INIT: Symbol = symbol_short!("INIT");
 const EVENT_MAINT: Symbol = symbol_short!("MAINT");

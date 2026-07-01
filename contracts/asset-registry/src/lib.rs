@@ -1398,7 +1398,7 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::PendingAdminAlreadyExists);
         }
         env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
         env.events().publish(
             (symbol_short!("PROP_ADM"),),
             (admin.clone(), new_admin.clone()),
@@ -1430,7 +1430,7 @@ impl AssetRegistry {
         }
         env.storage().instance().set(&ADMIN_KEY, &pending_admin);
         env.storage().instance().remove(&PENDING_ADMIN_KEY);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("ADMIN_SET")),
             (pending_admin.clone(), env.ledger().timestamp()),
@@ -1972,7 +1972,7 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
 
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
 
         let tl_key = global_timelock_key(symbol_short!("UPGRADE"));
         env.storage().persistent().set(
@@ -2033,7 +2033,7 @@ impl AssetRegistry {
             .persistent()
             .remove(&symbol_short!("PEND_UPG"));
 
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
 
         env.events().publish(
             (symbol_short!("UPGRADE"), admin.clone()),
